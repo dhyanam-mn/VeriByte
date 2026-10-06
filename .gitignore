@@ -3,4 +3,5 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.bc
+!tests/malicious/*.bc
 .DS_Store
