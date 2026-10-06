@@ -4,14 +4,18 @@
 Usage:
     python svm.py compile file.ml -o out.bc
     python svm.py disasm out.bc
+    python svm.py run out.bc [--unsafe]
+    python svm.py run file.ml [--unsafe]
 """
 
 import argparse
 import sys
+from pathlib import Path
 
 from minilang.parser import parse
 from semantic import analyze
-from codegen import generate, write_bytecode, load_bytecode, disassemble
+from codegen import generate, write_bytecode, load_bytecode, disassemble, BCModule
+from vm import VM, verify
 
 
 def cmd_compile(args: argparse.Namespace) -> None:
@@ -37,6 +41,28 @@ def cmd_disasm(args: argparse.Namespace) -> None:
     print(disassemble(module), end="")
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    path = Path(args.file)
+    if path.suffix == ".ml":
+        source = path.read_text(encoding="utf-8")
+        prog = parse(source)
+        st = analyze(prog)
+        functions = generate(prog, st)
+        entry_func = next(
+            i for i, fn in enumerate(functions) if fn.name == "main"
+        )
+        module = BCModule(version=1, entry_func=entry_func, functions=functions)
+    else:
+        module = load_bytecode(path)
+
+    if not args.unsafe:
+        verify(module)
+
+    vm = VM()
+    ret = vm.run(module)
+    return ret if isinstance(ret, int) else 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Secure Bytecode VM toolchain")
@@ -49,11 +75,18 @@ def main() -> None:
     p_disasm = sub.add_parser("disasm", help="Disassemble a .bc file")
     p_disasm.add_argument("file", help="Bytecode file (.bc)")
 
+    p_run = sub.add_parser("run", help="Run a .bc or .ml program")
+    p_run.add_argument("file", help="Bytecode file (.bc) or source (.ml)")
+    p_run.add_argument("--unsafe", action="store_true", help="Skip bytecode verification")
+
     args = parser.parse_args()
     if args.command == "compile":
         cmd_compile(args)
     elif args.command == "disasm":
         cmd_disasm(args)
+    elif args.command == "run":
+        ret = cmd_run(args)
+        sys.exit(ret)
     else:
         parser.print_help()
         sys.exit(1)
