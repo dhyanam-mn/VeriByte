@@ -5,11 +5,10 @@ Currently, this is a no-op hook.
 """
 
 from codegen.serializer import BCModule
+from verifier import verify as static_verify
 
 
 def verify(program: BCModule) -> None:
-    """Validate program safety before execution.
+    """Validate program safety before execution using the static verifier."""
+    static_verify(program)
 
-    Currently a no-op placeholder for the static verifier in Review 3.
-    """
-    pass

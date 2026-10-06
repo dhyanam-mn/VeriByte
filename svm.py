@@ -4,6 +4,7 @@
 Usage:
     python svm.py compile file.ml -o out.bc
     python svm.py disasm out.bc
+    python svm.py verify out.bc
     python svm.py run out.bc [--unsafe]
     python svm.py run file.ml [--unsafe]
 """
@@ -16,6 +17,7 @@ from minilang.parser import parse
 from semantic import analyze
 from codegen import generate, write_bytecode, load_bytecode, disassemble, BCModule
 from vm import VM, verify
+from verifier import VerifyError
 
 
 def cmd_compile(args: argparse.Namespace) -> None:
@@ -41,6 +43,16 @@ def cmd_disasm(args: argparse.Namespace) -> None:
     print(disassemble(module), end="")
 
 
+def cmd_verify(args: argparse.Namespace) -> None:
+    module = load_bytecode(args.file)
+    try:
+        verify(module)
+        print(f"verified {args.file}")
+    except VerifyError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     path = Path(args.file)
     if path.suffix == ".ml":
@@ -56,7 +68,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         module = load_bytecode(path)
 
     if not args.unsafe:
-        verify(module)
+        try:
+            verify(module)
+        except VerifyError as e:
+            print(f"verification failed:\n{e}", file=sys.stderr)
+            sys.exit(1)
 
     vm = VM()
     ret = vm.run(module)
@@ -75,6 +91,9 @@ def main() -> None:
     p_disasm = sub.add_parser("disasm", help="Disassemble a .bc file")
     p_disasm.add_argument("file", help="Bytecode file (.bc)")
 
+    p_verify = sub.add_parser("verify", help="Verify a .bc file")
+    p_verify.add_argument("file", help="Bytecode file (.bc)")
+
     p_run = sub.add_parser("run", help="Run a .bc or .ml program")
     p_run.add_argument("file", help="Bytecode file (.bc) or source (.ml)")
     p_run.add_argument("--unsafe", action="store_true", help="Skip bytecode verification")
@@ -84,6 +103,8 @@ def main() -> None:
         cmd_compile(args)
     elif args.command == "disasm":
         cmd_disasm(args)
+    elif args.command == "verify":
+        cmd_verify(args)
     elif args.command == "run":
         ret = cmd_run(args)
         sys.exit(ret)
