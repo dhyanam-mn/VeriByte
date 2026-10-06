@@ -184,6 +184,7 @@ class _Analyzer:
                 f"assignment type mismatch for '{stmt.name}': "
                 f"expected {info.type}, got {val_type}",
                 stmt.line, stmt.col)
+        stmt.slot = info.slot  # type: ignore[attr-defined]
 
     def _check_if(self, stmt: A.IfStmt) -> None:
         cond_type = self._check_expr(stmt.cond)
