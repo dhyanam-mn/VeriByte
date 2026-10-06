@@ -2,11 +2,12 @@
 """CLI for the Secure Bytecode VM toolchain.
 
 Usage:
-    python svm.py compile file.ml -o out.bc
+    python svm.py compile file.ml -o out.bc [--opt]
+    python svm.py optimize in.bc -o out.bc
     python svm.py disasm out.bc
     python svm.py verify out.bc
-    python svm.py run out.bc [--unsafe]
-    python svm.py run file.ml [--unsafe]
+    python svm.py run out.bc [--opt] [--unsafe]
+    python svm.py run file.ml [--opt] [--unsafe]
 """
 
 import argparse
@@ -16,6 +17,7 @@ from pathlib import Path
 from minilang.parser import parse
 from semantic import analyze
 from codegen import generate, write_bytecode, load_bytecode, disassemble, BCModule
+from optimizer import optimize_module
 from vm import VM, verify
 from verifier import VerifyError
 
@@ -30,12 +32,26 @@ def cmd_compile(args: argparse.Namespace) -> None:
     entry_func = next(
         i for i, fn in enumerate(functions) if fn.name == "main"
     )
+    module = BCModule(version=1, entry_func=entry_func, functions=functions)
+
+    if args.opt:
+        module = optimize_module(module)
 
     out_path = args.output
     if out_path is None:
         out_path = args.file.rsplit(".", 1)[0] + ".bc"
-    write_bytecode(out_path, functions, entry_func)
+    write_bytecode(out_path, module.functions, module.entry_func)
     print(f"wrote {out_path}")
+
+
+def cmd_optimize(args: argparse.Namespace) -> None:
+    module = load_bytecode(args.file)
+    opt_module = optimize_module(module)
+    out_path = args.output
+    if out_path is None:
+        out_path = args.file.rsplit(".", 1)[0] + ".opt.bc"
+    write_bytecode(out_path, opt_module.functions, opt_module.entry_func)
+    print(f"optimized {args.file} -> {out_path}")
 
 
 def cmd_disasm(args: argparse.Namespace) -> None:
@@ -67,6 +83,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         module = load_bytecode(path)
 
+    # Pipeline: Compile -> Optimize -> Verify -> Run
+    if args.opt:
+        module = optimize_module(module)
+
     if not args.unsafe:
         try:
             verify(module)
@@ -87,6 +107,11 @@ def main() -> None:
     p_compile = sub.add_parser("compile", help="Compile MiniLang to .bc")
     p_compile.add_argument("file", help="MiniLang source file (.ml)")
     p_compile.add_argument("-o", "--output", help="Output .bc path")
+    p_compile.add_argument("--opt", action="store_true", help="Enable bytecode optimizations")
+
+    p_optimize = sub.add_parser("optimize", help="Optimize a .bc bytecode file")
+    p_optimize.add_argument("file", help="Input .bc file")
+    p_optimize.add_argument("-o", "--output", help="Output .bc path")
 
     p_disasm = sub.add_parser("disasm", help="Disassemble a .bc file")
     p_disasm.add_argument("file", help="Bytecode file (.bc)")
@@ -96,11 +121,14 @@ def main() -> None:
 
     p_run = sub.add_parser("run", help="Run a .bc or .ml program")
     p_run.add_argument("file", help="Bytecode file (.bc) or source (.ml)")
+    p_run.add_argument("--opt", action="store_true", help="Enable bytecode optimizations")
     p_run.add_argument("--unsafe", action="store_true", help="Skip bytecode verification")
 
     args = parser.parse_args()
     if args.command == "compile":
         cmd_compile(args)
+    elif args.command == "optimize":
+        cmd_optimize(args)
     elif args.command == "disasm":
         cmd_disasm(args)
     elif args.command == "verify":
