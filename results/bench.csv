@@ -1,0 +1,15 @@
+category,name,bytecode_bytes,opt_bytes,opt_time_ms,overhead_pct,size_saved_pct,speedup,statements,throughput_kb_s,total_time_ms,unopt_bytes,unopt_time_ms,verify_time_ms,vm_time_ms
+verification_scaling,scale_20_stmts,252,,,,,,20,176.18395618556698,,,,1.3968,
+verification_scaling,scale_50_stmts,612,,,,,,50,198.24076223961788,,,,3.0148,
+verification_scaling,scale_100_stmts,1212,,,,,,100,167.36549956093899,,,,7.07191,
+verification_scaling,scale_250_stmts,3012,,,,,,250,184.9297854268295,,,,15.90553,
+verification_scaling,scale_500_stmts,6012,,,,,,500,188.02256010517056,,,,31.225475,
+verification_scaling,scale_1000_stmts,12012,,,,,,1000,177.0037784948852,,,,66.27242,
+verifier_overhead,Factorial,,,,0.09257251138235614,,,,,406.873865,,,0.376305,406.49756
+verifier_overhead,Fibonacci,,,,0.05778749461912592,,,,,1316.624685,,,0.760405,1315.86428
+verifier_overhead,GCD Loop,,,,0.09231230970940668,,,,,448.28436999999997,,,0.41344,447.87093
+verifier_overhead,Prime Sieve,,,,0.478207055571338,,,,,137.161655,,,0.652795,136.50886
+optimizer_impact,Constant Arithmetic,,59,75.10664,,28.915662650602407,1.1543345568381171,,,,83,86.69819,,
+optimizer_impact,Unused Computations,,57,77.68262,,22.972972972972975,1.2775031274691817,,,,74,99.23979,,
+optimizer_impact,Factorial (500x),,93,315.34601,,0.0,1.1593966893698768,,,,93,365.61112,,
+optimizer_impact,GCD Loop (1000x),,104,371.69614,,0.0,0.816174792668011,,,,104,303.36902,,
