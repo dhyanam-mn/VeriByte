@@ -65,7 +65,7 @@ class VM:
     def __init__(self, stdout: Optional[TextIO] = None) -> None:
         self.stdout: TextIO = stdout if stdout is not None else sys.stdout
 
-    def run(self, module: BCModule) -> Any:
+    def run(self, module: BCModule, max_steps: Optional[int] = None) -> Any:
         """Execute a compiled module starting from its entry_func."""
         entry_fn = module.functions[module.entry_func]
         initial_frame = Frame(
@@ -75,8 +75,14 @@ class VM:
             stack=[],
         )
         frames: List[Frame] = [initial_frame]
+        steps = 0
 
         while frames:
+            if max_steps is not None:
+                steps += 1
+                if steps > max_steps:
+                    raise TimeoutError(f"Step limit {max_steps} exceeded")
+
             frame = frames[-1]
             code = frame.fn.code
             pc = frame.pc
