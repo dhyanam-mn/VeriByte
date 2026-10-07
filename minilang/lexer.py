@@ -6,6 +6,18 @@ from .errors import LexError
 from .tokens import KEYWORDS, ONE_CHAR, TWO_CHAR, TT, Token
 
 
+def _is_ascii_digit(ch: str) -> bool:
+    return "0" <= ch <= "9"
+
+
+def _is_ascii_alpha(ch: str) -> bool:
+    return ("a" <= ch <= "z") or ("A" <= ch <= "Z")
+
+
+def _is_ascii_alnum(ch: str) -> bool:
+    return _is_ascii_alpha(ch) or _is_ascii_digit(ch)
+
+
 class Lexer:
     def __init__(self, source: str):
         self.src = source
@@ -55,16 +67,16 @@ class Lexer:
             if ch == "":
                 tokens.append(Token(TT.EOF, "", line, col))
                 return tokens
-            if ch.isdigit():
+            if _is_ascii_digit(ch):
                 start = self.pos
-                while self._peek().isdigit():
+                while _is_ascii_digit(self._peek()):
                     self._advance()
-                if self._peek().isalpha() or self._peek() == "_":
+                if _is_ascii_alpha(self._peek()) or self._peek() == "_":
                     raise LexError("invalid number literal", line, col)
                 tokens.append(Token(TT.INT_LIT, self.src[start:self.pos], line, col))
-            elif ch.isalpha() or ch == "_":
+            elif _is_ascii_alpha(ch) or ch == "_":
                 start = self.pos
-                while self._peek().isalnum() or self._peek() == "_":
+                while _is_ascii_alnum(self._peek()) or self._peek() == "_":
                     self._advance()
                 text = self.src[start:self.pos]
                 tokens.append(Token(KEYWORDS.get(text, TT.ID), text, line, col))

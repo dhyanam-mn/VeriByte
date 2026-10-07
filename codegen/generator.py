@@ -37,6 +37,7 @@ class BCFunction:
     local_types: List[str]     # declared types; parameters first
     max_stack: int
     code: bytes
+    jump_targets: Optional[List[int]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +102,12 @@ class _FuncBuilder:
         self.emit_u16(0)  # placeholder
 
     def patch_jumps(self) -> None:
+        self.jump_targets: List[int] = []
         for offset, label in self._patches:
             assert label.offset is not None, "label never placed"
+            if label.offset > 65535:
+                raise ValueError(f"jump target {label.offset} exceeds 16-bit max (65535)")
+            self.jump_targets.append(label.offset)
             struct.pack_into("<H", self._buf, offset, label.offset)
 
     def finish(self) -> tuple[bytes, int]:
@@ -132,6 +137,11 @@ class _FuncBuilder:
             self._gen_call(expr)
 
     def _gen_unary(self, expr: A.UnaryExpr) -> None:
+        if expr.op == "-" and isinstance(expr.operand, A.IntLit) and expr.operand.value == 2147483648:
+            self.emit_op(Op.PUSH_INT)
+            self.emit_i32(-2147483648)
+            self._push()
+            return
         self.gen_expr(expr.operand)
         if expr.op == "-":
             self.emit_op(Op.NEG)
@@ -296,6 +306,7 @@ def generate(prog: A.Program, st: SymbolTable) -> List[BCFunction]:
             local_types=local_types,
             max_stack=max_stack,
             code=code,
+            jump_targets=builder.jump_targets,
         ))
 
     return result

@@ -36,6 +36,7 @@ from minilang.parser import parse
 from semantic import analyze
 from codegen import generate, serialize, load_bytecode, BCFunction, BCModule, Op
 from codegen.opcodes import OPERAND_SIZE
+from optimizer import optimize_module
 from verifier import verify, VerifyError
 from vm import VM, VMTrap
 
@@ -211,6 +212,7 @@ def run_fuzzer(
     num_mutations: int,
     seed: int,
     step_limit: int = 10000,
+    opt: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Run the mutation fuzzer and return (records, summary)."""
     rng = random.Random(seed)
@@ -270,6 +272,26 @@ def run_fuzzer(
                     safe_status = f"CRASH_{type(e).__name__}"
                     soundness_violation = True
                     soundness_violations += 1
+
+                if opt and not soundness_violation:
+                    try:
+                        opt_mod = optimize_module(mutant)
+                        verify(opt_mod)
+                        vm_opt = VM(stdout=devnull)
+                        vm_opt.run(opt_mod, max_steps=step_limit)
+                        safe_status = "CLEAN_OPT"
+                    except VMTrap:
+                        safe_status = "VM_TRAP_OPT"
+                    except TimeoutError:
+                        safe_status = "STEP_LIMIT_OPT"
+                    except VerifyError as ve:
+                        safe_status = f"OPT_VERIFY_{ve.rule}"
+                        soundness_violation = True
+                        soundness_violations += 1
+                    except Exception as e:
+                        safe_status = f"OPT_CRASH_{type(e).__name__}"
+                        soundness_violation = True
+                        soundness_violations += 1
 
             elif verdict == "REJECTED":
                 rejected_count += 1
@@ -361,6 +383,8 @@ def main():
                         help="Directory containing valid .ml examples")
     parser.add_argument("--step-limit", type=int, default=10000,
                         help="Maximum VM execution steps per test (default: 10000)")
+    parser.add_argument("--opt", action="store_true",
+                        help="Enable optimizer on accepted mutants and verify/run them")
 
     args = parser.parse_args()
 
@@ -369,6 +393,7 @@ def main():
         num_mutations=args.iterations,
         seed=args.seed,
         step_limit=args.step_limit,
+        opt=args.opt,
     )
 
     print_summary(summary)

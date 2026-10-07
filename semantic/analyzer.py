@@ -230,6 +230,10 @@ class _Analyzer:
 
     def _infer(self, expr: A.Expr) -> str:
         if isinstance(expr, A.IntLit):
+            if expr.value > 2147483647:
+                raise SemanticError(
+                    f"integer literal {expr.value} exceeds 32-bit signed max 2147483647",
+                    expr.line, expr.col)
             return "int"
         if isinstance(expr, A.BoolLit):
             return "bool"
@@ -255,6 +259,9 @@ class _Analyzer:
         return info.type
 
     def _infer_unary(self, expr: A.UnaryExpr) -> str:
+        if expr.op == "-" and isinstance(expr.operand, A.IntLit) and expr.operand.value == 2147483648:
+            expr.operand.resolved_type = "int"
+            return "int"
         operand_type = self._check_expr(expr.operand)
         if expr.op == "-":
             if operand_type != "int":

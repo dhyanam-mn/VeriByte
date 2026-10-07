@@ -16,7 +16,10 @@ from pathlib import Path
 
 from minilang.parser import parse
 from semantic import analyze
-from codegen import generate, write_bytecode, load_bytecode, disassemble, BCModule
+from codegen import (
+    generate, write_bytecode, load_bytecode, disassemble,
+    BCModule, BytecodeFormatError,
+)
 from optimizer import optimize_module
 from vm import VM, verify
 from verifier import VerifyError
@@ -45,7 +48,18 @@ def cmd_compile(args: argparse.Namespace) -> None:
 
 
 def cmd_optimize(args: argparse.Namespace) -> None:
-    module = load_bytecode(args.file)
+    try:
+        module = load_bytecode(args.file)
+    except BytecodeFormatError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        verify(module)
+    except VerifyError as e:
+        print(f"verification failed:\n{e}", file=sys.stderr)
+        sys.exit(1)
+
     opt_module = optimize_module(module)
     out_path = args.output
     if out_path is None:
@@ -55,12 +69,21 @@ def cmd_optimize(args: argparse.Namespace) -> None:
 
 
 def cmd_disasm(args: argparse.Namespace) -> None:
-    module = load_bytecode(args.file)
+    try:
+        module = load_bytecode(args.file)
+    except BytecodeFormatError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
     print(disassemble(module), end="")
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
-    module = load_bytecode(args.file)
+    try:
+        module = load_bytecode(args.file)
+    except BytecodeFormatError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     try:
         verify(module)
         print(f"verified {args.file}")
@@ -80,19 +103,40 @@ def cmd_run(args: argparse.Namespace) -> int:
             i for i, fn in enumerate(functions) if fn.name == "main"
         )
         module = BCModule(version=1, entry_func=entry_func, functions=functions)
+
+        if args.opt:
+            module = optimize_module(module)
+
+        if not args.unsafe:
+            try:
+                verify(module)
+            except VerifyError as e:
+                print(f"verification failed:\n{e}", file=sys.stderr)
+                sys.exit(1)
     else:
-        module = load_bytecode(path)
-
-    # Pipeline: Compile -> Optimize -> Verify -> Run
-    if args.opt:
-        module = optimize_module(module)
-
-    if not args.unsafe:
         try:
-            verify(module)
-        except VerifyError as e:
-            print(f"verification failed:\n{e}", file=sys.stderr)
+            module = load_bytecode(path)
+        except BytecodeFormatError as e:
+            print(f"error: {e}", file=sys.stderr)
             sys.exit(1)
+
+        # For .bc input, verify BEFORE optimize
+        if not args.unsafe:
+            try:
+                verify(module)
+            except VerifyError as e:
+                print(f"verification failed:\n{e}", file=sys.stderr)
+                sys.exit(1)
+
+        if args.opt:
+            module = optimize_module(module)
+            # Verify again after optimizing
+            if not args.unsafe:
+                try:
+                    verify(module)
+                except VerifyError as e:
+                    print(f"verification failed:\n{e}", file=sys.stderr)
+                    sys.exit(1)
 
     vm = VM()
     ret = vm.run(module)
