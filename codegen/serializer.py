@@ -60,11 +60,27 @@ def serialize(functions: List[BCFunction], entry_func: int) -> bytes:
 
     for fn in functions:
         # name
-        name_bytes = fn.name.encode("ascii")
+        try:
+            name_bytes = fn.name.encode("ascii")
+        except UnicodeEncodeError as e:
+            raise ValueError(f"function '{fn.name}' name is not valid ASCII: {e}")
+        if len(name_bytes) > 255:
+            raise ValueError(f"function '{fn.name}' name exceeds 255 bytes ({len(name_bytes)})")
+
+        # params
+        if len(fn.param_types) > 255:
+            raise ValueError(f"function '{fn.name}' parameter count exceeds 255 ({len(fn.param_types)})")
+
+        # jump targets
+        jump_targets = getattr(fn, "jump_targets", None)
+        if jump_targets:
+            for jt in jump_targets:
+                if jt > 65535:
+                    raise ValueError(f"function '{fn.name}' jump target {jt} exceeds 65535")
+
         buf.append(len(name_bytes))
         buf.extend(name_bytes)
 
-        # params
         buf.append(len(fn.param_types))
         for pt in fn.param_types:
             buf.append(_TYPE_TO_BYTE[pt])
@@ -131,7 +147,12 @@ def load_bytecode(path: Union[str, Path]) -> BCModule:
         for i in range(num_funcs):
             # name
             name_len = struct.unpack("B", _read(f, 1, f"func[{i}].name_len"))[0]
-            name = _read(f, name_len, f"func[{i}].name").decode("ascii")
+            name_bytes = _read(f, name_len, f"func[{i}].name")
+            try:
+                name = name_bytes.decode("ascii")
+            except UnicodeDecodeError as e:
+                raise BytecodeFormatError(
+                    f"func[{i}]: invalid ASCII function name: {e}")
 
             # params
             num_params = struct.unpack("B", _read(f, 1, f"func[{i}].num_params"))[0]
