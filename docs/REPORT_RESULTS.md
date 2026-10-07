@@ -6,33 +6,58 @@ This report summarizes the experimental evaluation of the Secure Bytecode VM acr
 
 ## 1. Differential Fuzzing & Soundness Verification
 
-The mutation-based fuzzer (`tools/fuzz.py`) evaluated 250 mutants across all 5 seed programs (`factorial.ml`, `fibonacci.ml`, `gcd.ml`, `logic.ml`, `prime.ml`) with fixed random seed 42.
+The mutation-based fuzzer (`tools/fuzz.py`) evaluated 15,000 mutants across all 5 seed programs (`factorial.ml`, `fibonacci.ml`, `gcd.ml`, `logic.ml`, `prime.ml`) over three independent random seeds (101, 202, 303), testing 1,000 mutations per seed program per run.
 
-### Summary Metrics
+### Execution Commands
 
-- **Total Mutants Tested**: 250
-- **Rejected by Verifier**: 206 (82.4%)
-- **Accepted by Verifier**: 44 (17.6%)
-- **Unsafe Mode VM Crashes**: 165
+```bash
+python tools/fuzz.py -n 1000 --seed 101 --output results/fuzz_seed_101.csv
+python tools/fuzz.py -n 1000 --seed 202 --output results/fuzz_seed_202.csv
+python tools/fuzz.py -n 1000 --seed 303 --output results/fuzz_seed_303.csv
+```
+
+To run with bytecode optimization verification (`--opt`):
+```bash
+python tools/fuzz.py -n 1000 --seed 42 --opt --output results/fuzz_results.csv
+```
+
+### Summary Metrics (15,000 Mutants Campaign)
+
+- **Total Mutants Tested**: 15,000
+- **Rejected by Verifier**: 12,339 (82.3%)
+- **Accepted by Verifier**: 2,661 (17.7%)
+- **Unsafe Mode VM Crashes**: 10,198
 - **Soundness Violations**: **0 (Zero)**
 
-### Rejection Breakdown by Rule
+### Multi-Seed Run Breakdown
+
+| Seed | Total Mutants | Accepted Mutants | Rejected Mutants | Unsafe Mode Crashes | Soundness Violations |
+|---|---|---|---|---|---|
+| **101** | 5,000 | 875 (17.5%) | 4,125 (82.5%) | 3,397 | **0** |
+| **202** | 5,000 | 866 (17.3%) | 4,134 (82.7%) | 3,459 | **0** |
+| **303** | 5,000 | 920 (18.4%) | 4,080 (81.6%) | 3,342 | **0** |
+| **Total** | **15,000** | **2,661 (17.7%)** | **12,339 (82.3%)** | **10,198** | **0 (Zero)** |
+
+### Rejection Breakdown by Rule (12,339 Rejections)
 
 | Rule | Meaning | Count | % of Rejections |
 |---|---|---|---|
-| `BAD_OPCODE` | Undecodable instruction byte or invalid bool operand | 113 | 54.9% |
-| `LOCAL_RANGE` | Out-of-bounds local variable access | 21 | 10.2% |
-| `TRUNCATED` | Incomplete instruction operands | 16 | 7.8% |
-| `FALLTHROUGH` | Control flow falling off end of code without return | 16 | 7.8% |
-| `BAD_JUMP` | Target out of bounds or landing mid-instruction | 12 | 5.8% |
-| `BAD_CALL` | Non-existent callee index or parameter type mismatch | 11 | 5.3% |
-| `STACK_OVERFLOW` | Stack depth exceeding declared `max_stack` | 5 | 2.4% |
-| `STACK_UNDERFLOW` | Popping empty or insufficient stack | 5 | 2.4% |
-| `STACK_TYPE` | Type mismatch in arithmetic, logic, or conditions | 4 | 1.9% |
-| `BAD_RETURN` | Return type mismatch or leftover items on stack | 3 | 1.5% |
+| `BAD_OPCODE` | Undecodable instruction byte or invalid bool operand | 6,100 | 49.4% |
+| `LOCAL_RANGE` | Out-of-bounds local variable access | 1,388 | 11.2% |
+| `TRUNCATED` | Incomplete instruction operands | 1,325 | 10.7% |
+| `BAD_CALL` | Non-existent callee index or parameter type mismatch | 732 | 5.9% |
+| `FALLTHROUGH` | Control flow falling off end of code without return | 722 | 5.9% |
+| `BAD_JUMP` | Target out of bounds or landing mid-instruction | 705 | 5.7% |
+| `STACK_OVERFLOW` | Stack depth exceeding declared `max_stack` | 663 | 5.4% |
+| `STACK_UNDERFLOW` | Popping empty or insufficient stack | 383 | 3.1% |
+| `STACK_TYPE` | Type mismatch in arithmetic, logic, or conditions | 166 | 1.3% |
+| `BAD_RETURN` | Return type mismatch or leftover items on stack | 109 | 0.9% |
+| `MERGE_MISMATCH` | Type conflict at control-flow convergence | 24 | 0.2% |
+| `LOCAL_UNSET` | Loading uninitialized local variable | 14 | 0.1% |
+| `LOCAL_TYPE` | Store type conflicting with local variable type | 8 | 0.1% |
 
 ### Key Finding
-Every mutant accepted by the verifier ran safely without any unhandled Python exceptions. Conversely, 165 unverified mutants crashed the VM when run with `--unsafe` (e.g. `IndexError`, `TypeError`), demonstrating that the verifier successfully guarantees type safety, memory safety, and control-flow integrity.
+Every mutant accepted by the verifier ran safely without any unhandled Python exceptions (zero soundness violations across 2,661 accepted mutants). Conversely, 10,198 unverified mutants crashed the VM when run with `--unsafe` (e.g. `IndexError`, `TypeError`, `ValueError`), demonstrating that the static verifier successfully guarantees type safety, memory safety, and control-flow integrity.
 
 ---
 

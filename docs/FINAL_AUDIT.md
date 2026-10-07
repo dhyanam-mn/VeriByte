@@ -1,7 +1,7 @@
 # Final Project Audit Report: VeriByte (Secure Bytecode VM with Static Verifier)
 
 **Date of Audit**: October 7, 2026  
-**Auditor**: Independent Compiler Design System Auditor  
+**Auditor**: Self-audit (Compiler Design System)  
 **Repository**: `https://github.com/dhyanam-mn/VeriByte.git`  
 **Target Commit / Tag**: `final`  
 
