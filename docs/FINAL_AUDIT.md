@@ -86,35 +86,37 @@ All valid example programs in `examples/` (`factorial.ml`, `fibonacci.ml`, `gcd.
 - **Optimized**: 5/5 valid programs accepted with **0 false rejections**.
 
 ### B. Massive Differential Fuzzing Campaign (15,000 Mutants)
-The fuzzer was run across 3 independent random seeds with 5,000 mutants per seed (1,000 mutations across each of the 5 seed programs):
+The fuzzer was run across 3 independent random seeds with 5,000 mutants per seed (1,000 mutations across each of the 5 seed programs) with bytecode optimization (`--opt`) and VM checked-mode oracle verification:
 
 | Seed | Total Mutants | Accepted Mutants | Rejected Mutants | Unsafe Mode Crashes | Soundness Violations |
 |---|---|---|---|---|---|
-| **101** | 5,000 | 875 (17.5%) | 4,125 (82.5%) | 3,397 | **0** |
-| **202** | 5,000 | 866 (17.3%) | 4,134 (82.7%) | 3,459 | **0** |
-| **303** | 5,000 | 920 (18.4%) | 4,080 (81.6%) | 3,342 | **0** |
-| **Total** | **15,000** | **2,661 (17.7%)** | **12,339 (82.3%)** | **10,198** | **0 (Zero)** |
+| **101** | 5,000 | 945 (18.9%) | 4,055 (81.1%) | 3,154 | **0** |
+| **202** | 5,000 | 882 (17.6%) | 4,118 (82.4%) | 3,144 | **0** |
+| **303** | 5,000 | 942 (18.8%) | 4,058 (81.2%) | 3,123 | **0** |
+| **Total** | **15,000** | **2,769 (18.5%)** | **12,231 (81.5%)** | **9,421** | **0 (Zero)** |
+
+*(Note: Earlier preliminary campaign at tag `final` tested 15,000 mutants before adding metadata mutation operators, yielding 2,661 accepted / 12,339 rejected / 10,198 unsafe crashes / 0 violations).*
 
 ### C. Fuzzing Rule Distribution (Combined Across 15,000 Mutants)
 Every single verifier rule was naturally exercised and validated by the mutation engine:
-1. `BAD_OPCODE`: 6,100 rejections (49.4%)
-2. `LOCAL_RANGE`: 1,388 rejections (11.2%)
-3. `TRUNCATED`: 1,325 rejections (10.7%)
-4. `BAD_CALL`: 732 rejections (5.9%)
-5. `FALLTHROUGH`: 722 rejections (5.9%)
-6. `BAD_JUMP`: 705 rejections (5.7%)
-7. `STACK_OVERFLOW`: 663 rejections (5.4%)
-8. `STACK_UNDERFLOW`: 383 rejections (3.1%)
-9. `STACK_TYPE`: 166 rejections (1.3%)
-10. `BAD_RETURN`: 109 rejections (0.9%)
-11. `MERGE_MISMATCH`: 24 rejections (0.2%)
-12. `LOCAL_UNSET`: 14 rejections (0.1%)
-13. `LOCAL_TYPE`: 8 rejections (0.1%)
+1. `BAD_OPCODE`: 5,402 rejections (44.2%)
+2. `LOCAL_RANGE`: 1,449 rejections (11.8%)
+3. `BAD_CALL`: 1,200 rejections (9.8%)
+4. `TRUNCATED`: 1,144 rejections (9.4%)
+5. `BAD_JUMP`: 667 rejections (5.5%)
+6. `FALLTHROUGH`: 632 rejections (5.2%)
+7. `STACK_OVERFLOW`: 481 rejections (3.9%)
+8. `STACK_UNDERFLOW`: 397 rejections (3.2%)
+9. `BAD_RETURN`: 340 rejections (2.8%)
+10. `LOCAL_TYPE`: 240 rejections (2.0%)
+11. `STACK_TYPE`: 141 rejections (1.2%)
+12. `LOCAL_UNSET`: 112 rejections (0.9%)
+13. `MERGE_MISMATCH`: 26 rejections (0.2%)
 
 ### D. Soundness Confirmation
 - **Target**: Zero soundness violations.
-- **Result**: **0 soundness violations** out of 2,661 accepted mutants. Every accepted program executed safely without unhandled Python crashes.
-- **Unsafe Mode Comparison**: Over 10,198 unverified mutants crashed with unhandled runtime errors (`IndexError`, `TypeError`, `ValueError`) under `--unsafe`, confirming that the verifier successfully filtered out catastrophic execution failures.
+- **Result**: **0 soundness violations** out of 2,769 accepted mutants under active VM checked-mode oracle testing (`VM(checked=True)`).
+- **Unsafe Mode Comparison**: Exactly **9,421** unverified mutants crashed with unhandled runtime errors (`IndexError`, `TypeError`, `ValueError`) under `--unsafe`, confirming that the verifier successfully filtered out catastrophic execution failures.
 
 ---
 
