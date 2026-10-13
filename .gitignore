@@ -5,3 +5,4 @@ __pycache__/
 *.bc
 !tests/malicious/*.bc
 .DS_Store
+review_bundle.txt

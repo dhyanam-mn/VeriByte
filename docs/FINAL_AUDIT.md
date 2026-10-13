@@ -56,7 +56,9 @@ OK (passes=161, failures=0, errors=0, skips=0)
   - `tests/test_verifier.py`: 38 tests (static verifier rule isolation, CLI)
   - `tests/test_malicious_suite.py`: 1 test (26 subtests validating malicious files on disk)
   - `tests/test_optimizer.py`: 13 tests (constant folding, peephole rules, output equivalence)
-  - **Total**: **161 unit tests**, 100% passing.
+  - `tests/test_hardening.py`: 7 tests (malformed binaries, int bounds, ASCII checks)
+  - `tests/test_oracle.py`: 27 tests (module headers, back-edge LOCAL_UNSET, checked-mode invariants, meta-test)
+  - **Total**: **195 unit tests**, 100% passing (161 at tag `final`, expanded to 195 in `final-v3` with security hardening and checked-mode oracle tests).
 
 ---
 

@@ -12,6 +12,8 @@ from .errors import VerifyError
 from .state import CONFLICT, State, UNSET, merge_states
 
 
+# Test-only hook: used strictly by tests/test_oracle.py to simulate a weakened
+# verifier and test the VM checked-mode soundness oracle. Defaults to True in production.
 CHECK_STACK_TYPE_ADD: bool = True
 
 
