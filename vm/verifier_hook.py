@@ -1,7 +1,7 @@
 """Verifier hook for bytecode loading and execution.
 
-In Review 3, this will be connected to the static verifier.
-Currently, this is a no-op hook.
+Delegates to the static verifier to validate module and function safety invariants
+before execution by the VM.
 """
 
 from codegen.serializer import BCModule

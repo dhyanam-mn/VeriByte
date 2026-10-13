@@ -1,0 +1,2015 @@
+===== FILE: verifier/__init__.py =====
+"""Static verifier package."""
+
+from .errors import VerifyError  # noqa: F401
+from .decoder import Instruction, decode_function  # noqa: F401
+from .verifier import verify, verify_function, verify_module_header  # noqa: F401
+===== FILE: verifier/errors.py =====
+"""Verifier error reporting."""
+
+
+class VerifyError(Exception):
+    """Raised when static bytecode verification fails."""
+
+    def __init__(self, func_name: str, offset: int, mnemonic: str, rule: str,
+                 expected: str = "", actual: str = ""):
+        self.func_name = func_name
+        self.offset = offset
+        self.mnemonic = mnemonic
+        self.rule = rule
+        self.expected = expected
+        self.actual = actual
+
+        lines = [f"verify error in function '{func_name}' at offset {offset} ({mnemonic}):"]
+        lines.append(f"  rule: {rule}")
+        if expected:
+            lines.append(f"  expected: {expected}")
+        if actual:
+            lines.append(f"  actual: {actual}")
+        super().__init__("\n".join(lines))
+===== FILE: verifier/decoder.py =====
+"""Bytecode instruction stream decoder and valid offset tracker."""
+
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass
+from typing import Any, List, Optional, Set, Tuple
+
+from codegen.generator import BCFunction
+from codegen.opcodes import MNEMONIC, OPERAND_SIZE, Op
+from .errors import VerifyError
+
+
+@dataclass
+class Instruction:
+    """Decoded bytecode instruction."""
+    offset: int
+    op: Op
+    operand: Any
+    size: int
+
+
+def decode_function(fn: BCFunction) -> Tuple[List[Instruction], Set[int]]:
+    """Decode instruction stream and record valid instruction start offsets.
+
+    Raises VerifyError(rule='BAD_OPCODE') or VerifyError(rule='TRUNCATED').
+    """
+    code = fn.code
+    instructions: List[Instruction] = []
+    valid_starts: Set[int] = set()
+
+    pc = 0
+    code_len = len(code)
+
+    while pc < code_len:
+        op_byte = code[pc]
+        try:
+            op = Op(op_byte)
+        except ValueError:
+            raise VerifyError(
+                func_name=fn.name,
+                offset=pc,
+                mnemonic=f"0x{op_byte:02X}",
+                rule="BAD_OPCODE",
+                expected="valid opcode byte",
+                actual=f"0x{op_byte:02X}",
+            )
+
+        operand_size = OPERAND_SIZE[op]
+        if pc + 1 + operand_size > code_len:
+            raise VerifyError(
+                func_name=fn.name,
+                offset=pc,
+                mnemonic=op.name,
+                rule="TRUNCATED",
+                expected=f"{operand_size} byte operand",
+                actual=f"only {code_len - pc - 1} byte(s) remaining",
+            )
+
+        if op == Op.PUSH_BOOL:
+            b_val = code[pc + 1]
+            if b_val not in (0, 1):
+                raise VerifyError(
+                    func_name=fn.name,
+                    offset=pc,
+                    mnemonic=op.name,
+                    rule="BAD_OPCODE",
+                    expected="0 or 1 for bool operand",
+                    actual=str(b_val),
+                )
+            operand: Any = bool(b_val != 0)
+        elif operand_size == 1:
+            operand = code[pc + 1]
+        elif operand_size == 2:
+            operand = struct.unpack_from("<H", code, pc + 1)[0]
+        elif operand_size == 4:
+            operand = struct.unpack_from("<i", code, pc + 1)[0]
+        else:
+            operand = None
+
+        instr_size = 1 + operand_size
+        instructions.append(Instruction(
+            offset=pc,
+            op=op,
+            operand=operand,
+            size=instr_size,
+        ))
+        valid_starts.add(pc)
+        pc += instr_size
+
+    return instructions, valid_starts
+===== FILE: verifier/cfg.py =====
+"""Control flow analysis, jump-target validation, and successor computation."""
+
+from __future__ import annotations
+
+from typing import List, Set
+
+from codegen.generator import BCFunction
+from codegen.opcodes import Op
+from .decoder import Instruction
+from .errors import VerifyError
+
+
+def check_jump_targets(fn: BCFunction, instructions: List[Instruction], valid_starts: Set[int]) -> None:
+    """Ensure every JMP / JMP_IF_FALSE target is a valid instruction start in this function.
+
+    Raises VerifyError(rule='BAD_JUMP') if any target is outside code or lands mid-instruction.
+    """
+    for instr in instructions:
+        if instr.op in (Op.JMP, Op.JMP_IF_FALSE):
+            target = instr.operand
+            if target not in valid_starts:
+                raise VerifyError(
+                    func_name=fn.name,
+                    offset=instr.offset,
+                    mnemonic=instr.op.name,
+                    rule="BAD_JUMP",
+                    expected="valid instruction start offset",
+                    actual=f"target offset {target}",
+                )
+
+
+def compute_successors(instr: Instruction) -> List[int]:
+    """Compute successor instruction offsets for a decoded instruction."""
+    if instr.op == Op.JMP:
+        return [instr.operand]
+    if instr.op == Op.JMP_IF_FALSE:
+        fallthrough = instr.offset + instr.size
+        return [fallthrough, instr.operand]
+    if instr.op in (Op.RET, Op.HALT):
+        return []
+    return [instr.offset + instr.size]
+===== FILE: verifier/state.py =====
+"""Abstract interpreter state representation and lattice merge operations."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple
+
+from .errors import VerifyError
+
+UNSET = "UNSET"
+CONFLICT = "CONFLICT"
+
+
+@dataclass(frozen=True)
+class State:
+    """Abstract state at a program point."""
+    stack: Tuple[str, ...]
+    locals: Tuple[str, ...]
+
+    def __repr__(self) -> str:
+        return f"State(stack={list(self.stack)}, locals={list(self.locals)})"
+
+
+def merge_states(s1: State, s2: State, func_name: str, offset: int, mnemonic: str) -> State:
+    """Merge abstract state s2 into s1 at a join point.
+
+    Raises VerifyError(rule='MERGE_MISMATCH') if stack depths or slot types disagree.
+    Locals that are UNSET on either path remain UNSET.
+    """
+    if len(s1.stack) != len(s2.stack):
+        raise VerifyError(
+            func_name=func_name,
+            offset=offset,
+            mnemonic=mnemonic,
+            rule="MERGE_MISMATCH",
+            expected=f"stack depth {len(s1.stack)}",
+            actual=f"stack depth {len(s2.stack)}",
+        )
+
+    merged_stack = []
+    for i, (t1, t2) in enumerate(zip(s1.stack, s2.stack)):
+        if t1 != t2:
+            raise VerifyError(
+                func_name=func_name,
+                offset=offset,
+                mnemonic=mnemonic,
+                rule="MERGE_MISMATCH",
+                expected=f"stack slot {i} type '{t1}'",
+                actual=f"stack slot {i} type '{t2}'",
+            )
+        merged_stack.append(t1)
+
+    merged_locals = []
+    for l1, l2 in zip(s1.locals, s2.locals):
+        if l1 == UNSET or l2 == UNSET:
+            merged_locals.append(UNSET)
+        elif l1 == l2:
+            merged_locals.append(l1)
+        else:
+            merged_locals.append(CONFLICT)
+
+    return State(
+        stack=tuple(merged_stack),
+        locals=tuple(merged_locals),
+    )
+===== FILE: verifier/verifier.py =====
+"""Worklist abstract interpreter and static verifier."""
+
+from __future__ import annotations
+
+from typing import Dict, List, Set
+
+from codegen.generator import BCFunction
+from codegen.opcodes import Op
+from codegen.serializer import BCModule
+from .cfg import check_jump_targets, compute_successors
+from .decoder import Instruction, decode_function
+from .errors import VerifyError
+from .state import CONFLICT, State, UNSET, merge_states
+
+
+def verify_module_header(module: BCModule) -> None:
+    """Validate module-level header, function table, and entry function."""
+    if not module.functions:
+        raise VerifyError("<header>", 0, "HEADER", "BAD_CALL",
+                          expected="at least one function", actual="0 functions")
+
+    if not (0 <= module.entry_func < len(module.functions)):
+        raise VerifyError("<header>", 0, "HEADER", "BAD_CALL",
+                          expected=f"entry_func index < {len(module.functions)}",
+                          actual=f"entry_func index {module.entry_func}")
+
+    entry_fn = module.functions[module.entry_func]
+    if entry_fn.name != "main" or len(entry_fn.param_types) != 0 or entry_fn.return_type != "int":
+        raise VerifyError(entry_fn.name, 0, "HEADER", "BAD_CALL",
+                          expected="entry function 'main(): int' taking 0 parameters",
+                          actual=f"{entry_fn.name}({', '.join(entry_fn.param_types)}): {entry_fn.return_type}")
+
+    for i, fn in enumerate(module.functions):
+        if len(fn.local_types) != fn.num_locals:
+            raise VerifyError(fn.name, 0, "SIGNATURE", "LOCAL_RANGE",
+                              expected=f"len(local_types) == num_locals ({fn.num_locals})",
+                              actual=f"len(local_types) == {len(fn.local_types)}")
+        if fn.num_locals < len(fn.param_types):
+            raise VerifyError(fn.name, 0, "SIGNATURE", "LOCAL_RANGE",
+                              expected=f"num_locals >= num_params ({len(fn.param_types)})",
+                              actual=f"num_locals {fn.num_locals}")
+        if fn.local_types[:len(fn.param_types)] != fn.param_types:
+            raise VerifyError(fn.name, 0, "SIGNATURE", "LOCAL_TYPE",
+                              expected=f"parameters match initial locals {fn.param_types}",
+                              actual=f"initial locals {fn.local_types[:len(fn.param_types)]}")
+
+
+def verify_function(fn: BCFunction, module: BCModule) -> None:
+    """Verify a single function using abstract interpretation."""
+    code_len = len(fn.code)
+    if code_len == 0:
+        raise VerifyError(
+            func_name=fn.name,
+            offset=0,
+            mnemonic="<empty>",
+            rule="FALLTHROUGH",
+            expected="non-empty code ending in RET or HALT",
+            actual="empty code",
+        )
+
+    # 1. Decode instruction stream & identify valid instruction starts
+    instructions, valid_starts = decode_function(fn)
+
+    # 2. Check all jump targets
+    check_jump_targets(fn, instructions, valid_starts)
+
+    instr_map: Dict[int, Instruction] = {inst.offset: inst for inst in instructions}
+
+    # 3. Worklist abstract interpretation
+    entry_locals = list(fn.param_types) + [UNSET] * (fn.num_locals - len(fn.param_types))
+    entry_state = State(stack=(), locals=tuple(entry_locals))
+
+    states: Dict[int, State] = {0: entry_state}
+    worklist: List[int] = [0]
+    in_worklist: Set[int] = {0}
+
+    while worklist:
+        pc = worklist.pop(0)
+        in_worklist.remove(pc)
+
+        state = states[pc]
+        instr = instr_map[pc]
+        op = instr.op
+        mnemonic = op.name
+        stack = state.stack
+        locals_tuple = state.locals
+
+        out_state: State | None = None
+
+        if op == Op.PUSH_INT:
+            if len(stack) + 1 > fn.max_stack:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_OVERFLOW",
+                                  expected=f"depth <= {fn.max_stack}", actual=f"{list(stack)}")
+            out_state = State(stack=stack + ("int",), locals=locals_tuple)
+
+        elif op == Op.PUSH_BOOL:
+            if len(stack) + 1 > fn.max_stack:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_OVERFLOW",
+                                  expected=f"depth <= {fn.max_stack}", actual=f"{list(stack)}")
+            out_state = State(stack=stack + ("bool",), locals=locals_tuple)
+
+        elif op == Op.POP:
+            if len(stack) < 1:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 1", actual=f"{list(stack)}")
+            out_state = State(stack=stack[:-1], locals=locals_tuple)
+
+        elif op == Op.DUP:
+            if len(stack) < 1:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 1", actual=f"{list(stack)}")
+            if len(stack) + 1 > fn.max_stack:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_OVERFLOW",
+                                  expected=f"depth <= {fn.max_stack}", actual=f"{list(stack)}")
+            out_state = State(stack=stack + (stack[-1],), locals=locals_tuple)
+
+        elif op in (Op.ADD, Op.SUB, Op.MUL, Op.DIV, Op.MOD):
+            if len(stack) < 2:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 2", actual=f"{list(stack)}")
+            b, a = stack[-1], stack[-2]
+            if a != "int" or b != "int":
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_TYPE",
+                                  expected="[int, int]", actual=f"{list(stack)}")
+            out_state = State(stack=stack[:-2] + ("int",), locals=locals_tuple)
+
+        elif op == Op.NEG:
+            if len(stack) < 1:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 1", actual=f"{list(stack)}")
+            if stack[-1] != "int":
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_TYPE",
+                                  expected="top is int", actual=f"{list(stack)}")
+            out_state = State(stack=stack[:-1] + ("int",), locals=locals_tuple)
+
+        elif op in (Op.AND, Op.OR):
+            if len(stack) < 2:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 2", actual=f"{list(stack)}")
+            b, a = stack[-1], stack[-2]
+            if a != "bool" or b != "bool":
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_TYPE",
+                                  expected="[bool, bool]", actual=f"{list(stack)}")
+            out_state = State(stack=stack[:-2] + ("bool",), locals=locals_tuple)
+
+        elif op == Op.NOT:
+            if len(stack) < 1:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 1", actual=f"{list(stack)}")
+            if stack[-1] != "bool":
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_TYPE",
+                                  expected="top is bool", actual=f"{list(stack)}")
+            out_state = State(stack=stack[:-1] + ("bool",), locals=locals_tuple)
+
+        elif op in (Op.EQ, Op.NE):
+            if len(stack) < 2:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 2", actual=f"{list(stack)}")
+            b, a = stack[-1], stack[-2]
+            if a != b:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_TYPE",
+                                  expected="same types on stack", actual=f"{list(stack)}")
+            out_state = State(stack=stack[:-2] + ("bool",), locals=locals_tuple)
+
+        elif op in (Op.LT, Op.GT, Op.LE, Op.GE):
+            if len(stack) < 2:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 2", actual=f"{list(stack)}")
+            b, a = stack[-1], stack[-2]
+            if a != "int" or b != "int":
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_TYPE",
+                                  expected="[int, int]", actual=f"{list(stack)}")
+            out_state = State(stack=stack[:-2] + ("bool",), locals=locals_tuple)
+
+        elif op == Op.LOAD:
+            idx = instr.operand
+            if idx >= fn.num_locals:
+                raise VerifyError(fn.name, pc, mnemonic, "LOCAL_RANGE",
+                                  expected=f"local < {fn.num_locals}", actual=f"local {idx}")
+            val = locals_tuple[idx]
+            if val == UNSET or val == CONFLICT:
+                raise VerifyError(fn.name, pc, mnemonic, "LOCAL_UNSET",
+                                  expected=f"definitely assigned local {idx}", actual=val)
+            if len(stack) + 1 > fn.max_stack:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_OVERFLOW",
+                                  expected=f"depth <= {fn.max_stack}", actual=f"{list(stack)}")
+            out_state = State(stack=stack + (val,), locals=locals_tuple)
+
+        elif op == Op.STORE:
+            idx = instr.operand
+            if idx >= fn.num_locals:
+                raise VerifyError(fn.name, pc, mnemonic, "LOCAL_RANGE",
+                                  expected=f"local < {fn.num_locals}", actual=f"local {idx}")
+            if len(stack) < 1:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 1", actual=f"{list(stack)}")
+            val = stack[-1]
+            declared_type = fn.local_types[idx]
+            if val != declared_type:
+                raise VerifyError(fn.name, pc, mnemonic, "LOCAL_TYPE",
+                                  expected=f"type '{declared_type}'", actual=f"'{val}'")
+            new_locals = list(locals_tuple)
+            new_locals[idx] = val
+            out_state = State(stack=stack[:-1], locals=tuple(new_locals))
+
+        elif op == Op.JMP:
+            out_state = state
+
+        elif op == Op.JMP_IF_FALSE:
+            if len(stack) < 1:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 1", actual=f"{list(stack)}")
+            if stack[-1] != "bool":
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_TYPE",
+                                  expected="top is bool", actual=f"{list(stack)}")
+            out_state = State(stack=stack[:-1], locals=locals_tuple)
+
+        elif op == Op.CALL:
+            func_idx = instr.operand
+            if func_idx >= len(module.functions):
+                raise VerifyError(fn.name, pc, mnemonic, "BAD_CALL",
+                                  expected=f"func_idx < {len(module.functions)}", actual=f"func_idx {func_idx}")
+            callee = module.functions[func_idx]
+            num_args = len(callee.param_types)
+            if len(stack) < num_args:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected=f"at least {num_args} args", actual=f"{list(stack)}")
+            args = list(stack[len(stack) - num_args:])
+            if args != callee.param_types:
+                raise VerifyError(fn.name, pc, mnemonic, "BAD_CALL",
+                                  expected=f"arguments {callee.param_types}", actual=f"arguments {args}")
+            stack_popped = stack[:len(stack) - num_args]
+            if len(stack_popped) + 1 > fn.max_stack:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_OVERFLOW",
+                                  expected=f"depth <= {fn.max_stack}", actual=f"{list(stack_popped)}")
+            out_state = State(stack=stack_popped + (callee.return_type,), locals=locals_tuple)
+
+        elif op == Op.RET:
+            if len(stack) < 1:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 1", actual=f"{list(stack)}")
+            if stack[-1] != fn.return_type or len(stack) != 1:
+                raise VerifyError(fn.name, pc, mnemonic, "BAD_RETURN",
+                                  expected=f"[{fn.return_type}]", actual=f"{list(stack)}")
+            out_state = None
+
+        elif op == Op.PRINT:
+            if len(stack) < 1:
+                raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
+                                  expected="depth >= 1", actual=f"{list(stack)}")
+            out_state = State(stack=stack[:-1], locals=locals_tuple)
+
+        elif op == Op.HALT:
+            out_state = None
+
+        if out_state is not None:
+            succs = compute_successors(instr)
+            for succ_pc in succs:
+                if succ_pc == code_len:
+                    raise VerifyError(fn.name, pc, mnemonic, "FALLTHROUGH",
+                                      expected="RET, JMP, or HALT before EOF",
+                                      actual="execution falls off end of code")
+                if succ_pc not in states:
+                    states[succ_pc] = out_state
+                    if succ_pc not in in_worklist:
+                        worklist.append(succ_pc)
+                        in_worklist.add(succ_pc)
+                else:
+                    succ_mnemonic = instr_map[succ_pc].op.name
+                    merged = merge_states(states[succ_pc], out_state, fn.name, succ_pc, succ_mnemonic)
+                    if merged != states[succ_pc]:
+                        states[succ_pc] = merged
+                        if succ_pc not in in_worklist:
+                            worklist.append(succ_pc)
+                            in_worklist.add(succ_pc)
+
+
+def verify(module: BCModule) -> None:
+    """Verify that a compiled bytecode module satisfies all static safety properties.
+
+    Raises VerifyError on any violation.
+    """
+    verify_module_header(module)
+    for fn in module.functions:
+        verify_function(fn, module)
+===== FILE: vm/__init__.py =====
+"""Virtual Machine package."""
+
+from .exceptions import VMTrap  # noqa: F401
+from .interpreter import VM, Frame, to_i32, idiv, imod  # noqa: F401
+from .verifier_hook import verify  # noqa: F401
+===== FILE: vm/exceptions.py =====
+"""VM runtime exceptions."""
+
+
+class VMTrap(Exception):
+    """Raised when execution hits a defined runtime trap, such as division or modulo by zero."""
+    pass
+===== FILE: vm/interpreter.py =====
+"""Bytecode Virtual Machine (interpreter).
+
+Implements the stack-based VM for the MiniLang ISA v1.
+- Fetch-decode-execute loop
+- Per-call frames (locals, operand stack, program counter)
+- CALL / RET
+- PRINT to a configurable output stream
+- 32-bit signed wraparound for integer arithmetic
+- VMTrap on division / modulo by zero
+- Raw Python exceptions allowed to surface for invalid code (stack underflow, bad jumps, etc.)
+"""
+
+from __future__ import annotations
+
+import struct
+import sys
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, TextIO
+
+from codegen.generator import BCFunction
+from codegen.opcodes import Op
+from codegen.serializer import BCModule
+from .exceptions import VMTrap
+
+
+def to_i32(val: int) -> int:
+    """Wrap integer into 32-bit signed range [-2^31, 2^31 - 1]."""
+    val = val & 0xFFFFFFFF
+    if val >= 0x80000000:
+        val -= 0x100000000
+    return val
+
+
+def idiv(a: int, b: int) -> int:
+    """32-bit integer division truncated towards zero, trapping on 0."""
+    if b == 0:
+        raise VMTrap("division by zero")
+    neg = (a < 0) ^ (b < 0)
+    res = -(abs(a) // abs(b)) if neg else abs(a) // abs(b)
+    return to_i32(res)
+
+
+def imod(a: int, b: int) -> int:
+    """32-bit integer modulo with sign matching dividend, trapping on 0."""
+    if b == 0:
+        raise VMTrap("modulo by zero")
+    rem = abs(a) % abs(b)
+    if a < 0:
+        rem = -rem
+    return to_i32(rem)
+
+
+@dataclass
+class Frame:
+    """Activation frame for a single function call."""
+    fn: BCFunction
+    pc: int = 0
+    locals: List[Any] = field(default_factory=list)
+    stack: List[Any] = field(default_factory=list)
+
+
+class VM:
+    """Stack-based virtual machine interpreter."""
+
+    def __init__(self, stdout: Optional[TextIO] = None) -> None:
+        self.stdout: TextIO = stdout if stdout is not None else sys.stdout
+
+    def run(self, module: BCModule, max_steps: Optional[int] = None) -> Any:
+        """Execute a compiled module starting from its entry_func."""
+        entry_fn = module.functions[module.entry_func]
+        initial_frame = Frame(
+            fn=entry_fn,
+            pc=0,
+            locals=[None] * entry_fn.num_locals,
+            stack=[],
+        )
+        frames: List[Frame] = [initial_frame]
+        steps = 0
+
+        while frames:
+            if max_steps is not None:
+                steps += 1
+                if steps > max_steps:
+                    raise TimeoutError(f"Step limit {max_steps} exceeded")
+
+            frame = frames[-1]
+            code = frame.fn.code
+            pc = frame.pc
+
+            # Fetch opcode
+            op_byte = code[pc]
+            frame.pc += 1
+
+            op = Op(op_byte)
+
+            if op == Op.PUSH_INT:
+                val = struct.unpack_from("<i", code, frame.pc)[0]
+                frame.pc += 4
+                frame.stack.append(val)
+
+            elif op == Op.PUSH_BOOL:
+                val = code[frame.pc]
+                frame.pc += 1
+                frame.stack.append(bool(val != 0))
+
+            elif op == Op.POP:
+                frame.stack.pop()
+
+            elif op == Op.DUP:
+                frame.stack.append(frame.stack[-1])
+
+            elif op == Op.ADD:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(to_i32(a + b))
+
+            elif op == Op.SUB:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(to_i32(a - b))
+
+            elif op == Op.MUL:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(to_i32(a * b))
+
+            elif op == Op.DIV:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(idiv(a, b))
+
+            elif op == Op.MOD:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(imod(a, b))
+
+            elif op == Op.NEG:
+                a = frame.stack.pop()
+                frame.stack.append(to_i32(-a))
+
+            elif op == Op.AND:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(bool(a and b))
+
+            elif op == Op.OR:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(bool(a or b))
+
+            elif op == Op.NOT:
+                a = frame.stack.pop()
+                frame.stack.append(not a)
+
+            elif op == Op.EQ:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(a == b)
+
+            elif op == Op.NE:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(a != b)
+
+            elif op == Op.LT:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(a < b)
+
+            elif op == Op.GT:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(a > b)
+
+            elif op == Op.LE:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(a <= b)
+
+            elif op == Op.GE:
+                b = frame.stack.pop()
+                a = frame.stack.pop()
+                frame.stack.append(a >= b)
+
+            elif op == Op.LOAD:
+                local_idx = struct.unpack_from("<H", code, frame.pc)[0]
+                frame.pc += 2
+                frame.stack.append(frame.locals[local_idx])
+
+            elif op == Op.STORE:
+                local_idx = struct.unpack_from("<H", code, frame.pc)[0]
+                frame.pc += 2
+                val = frame.stack.pop()
+                frame.locals[local_idx] = val
+
+            elif op == Op.JMP:
+                target = struct.unpack_from("<H", code, frame.pc)[0]
+                frame.pc = target
+
+            elif op == Op.JMP_IF_FALSE:
+                target = struct.unpack_from("<H", code, frame.pc)[0]
+                cond = frame.stack.pop()
+                if not cond:
+                    frame.pc = target
+                else:
+                    frame.pc += 2
+
+            elif op == Op.CALL:
+                func_idx = struct.unpack_from("<H", code, frame.pc)[0]
+                frame.pc += 2
+                target_fn = module.functions[func_idx]
+                num_params = len(target_fn.param_types)
+                # Arguments were pushed left-to-right, so top of stack is the last param
+                args = [frame.stack.pop() for _ in range(num_params)]
+                args.reverse()
+
+                new_locals = [None] * target_fn.num_locals
+                new_locals[:num_params] = args
+                new_frame = Frame(
+                    fn=target_fn,
+                    pc=0,
+                    locals=new_locals,
+                    stack=[],
+                )
+                frames.append(new_frame)
+
+            elif op == Op.RET:
+                ret_val = frame.stack.pop()
+                frames.pop()
+                if frames:
+                    frames[-1].stack.append(ret_val)
+                else:
+                    return ret_val
+
+            elif op == Op.PRINT:
+                val = frame.stack.pop()
+                if isinstance(val, bool):
+                    text = "true" if val else "false"
+                else:
+                    text = str(val)
+                self.stdout.write(f"{text}\n")
+                self.stdout.flush()
+
+            elif op == Op.HALT:
+                return frame.stack[-1] if frame.stack else 0
+
+        return 0
+===== FILE: vm/verifier_hook.py =====
+"""Verifier hook for bytecode loading and execution.
+
+In Review 3, this will be connected to the static verifier.
+Currently, this is a no-op hook.
+"""
+
+from codegen.serializer import BCModule
+from verifier import verify as static_verify
+
+
+def verify(program: BCModule) -> None:
+    """Validate program safety before execution using the static verifier."""
+    static_verify(program)
+
+===== FILE: tools/fuzz.py =====
+#!/usr/bin/env python3
+"""Mutation-based fuzzer for the Secure Bytecode VM and Verifier.
+
+Applies random mutations (bit flip, byte replace, opcode swap, operand corruption,
+truncation, insertion, deletion) to valid compiled bytecode modules, testing:
+1. Verifier rejection coverage.
+2. VM soundness: Any accepted mutant executed by the VM must NEVER cause raw
+   Python crashes (only clean completion or VMTrap for division by zero).
+3. Unsafe behavior: Rejected mutants executed in --unsafe mode are tracked to
+   demonstrate crashes and misbehavior that the verifier successfully prevented.
+
+Outputs:
+  - Text summary table to stdout.
+  - CSV results to results/fuzz_results.csv.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import io
+import os
+import random
+import struct
+import sys
+from pathlib import Path
+
+# Add project root to sys.path so modules can be imported when running script directly
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from typing import Any, Callable, Dict, List, Tuple
+
+from minilang.parser import parse
+from semantic import analyze
+from codegen import generate, serialize, load_bytecode, BCFunction, BCModule, Op
+from codegen.opcodes import OPERAND_SIZE
+from optimizer import optimize_module
+from verifier import verify, VerifyError
+from vm import VM, VMTrap
+
+
+# ---------------------------------------------------------------------------
+# Seed Programs
+# ---------------------------------------------------------------------------
+
+EXAMPLE_FILES = [
+    "factorial.ml",
+    "fibonacci.ml",
+    "gcd.ml",
+    "logic.ml",
+    "prime.ml",
+]
+
+
+def load_seed_module(filepath: Path) -> BCModule:
+    """Compile a MiniLang source file into a BCModule."""
+    source = filepath.read_text(encoding="utf-8")
+    prog = parse(source)
+    st = analyze(prog)
+    fns = generate(prog, st)
+    entry_func = next(i for i, fn in enumerate(fns) if fn.name == "main")
+    return BCModule(version=1, entry_func=entry_func, functions=fns)
+
+
+# ---------------------------------------------------------------------------
+# Mutation Operators
+# ---------------------------------------------------------------------------
+
+ALL_OPCODES = list(Op)
+
+
+def mutate_bit_flip(code: bytearray, rng: random.Random) -> str:
+    if not code:
+        return "bit_flip"
+    idx = rng.randrange(len(code))
+    bit = rng.randrange(8)
+    code[idx] ^= (1 << bit)
+    return "bit_flip"
+
+
+def mutate_byte_replace(code: bytearray, rng: random.Random) -> str:
+    if not code:
+        return "byte_replace"
+    idx = rng.randrange(len(code))
+    code[idx] = rng.randrange(256)
+    return "byte_replace"
+
+
+def mutate_opcode_swap(code: bytearray, rng: random.Random) -> str:
+    if not code:
+        return "opcode_swap"
+    # Find instruction offsets
+    offsets = []
+    pc = 0
+    while pc < len(code):
+        offsets.append(pc)
+        op_byte = code[pc]
+        try:
+            op = Op(op_byte)
+            pc += 1 + OPERAND_SIZE[op]
+        except ValueError:
+            pc += 1
+    if not offsets:
+        return "opcode_swap"
+    target_offset = rng.choice(offsets)
+    code[target_offset] = rng.choice(ALL_OPCODES).value
+    return "opcode_swap"
+
+
+def mutate_operand_corruption(code: bytearray, rng: random.Random) -> str:
+    if len(code) < 3:
+        return "operand_corruption"
+    idx = rng.randrange(len(code) - 1)
+    boundary_values = [0, 1, 2, 255, 32767, 65535, -1, -2147483648, 2147483647]
+    val = rng.choice(boundary_values)
+    # Choose 2-byte or 4-byte corruption
+    if rng.random() < 0.5 and idx + 2 <= len(code):
+        struct.pack_into("<H", code, idx, val & 0xFFFF)
+    elif idx + 4 <= len(code):
+        struct.pack_into("<i", code, idx, val if -2147483648 <= val <= 2147483647 else 0)
+    else:
+        code[idx] = val & 0xFF
+    return "operand_corruption"
+
+
+def mutate_truncation(code: bytearray, rng: random.Random) -> str:
+    if len(code) <= 1:
+        return "truncation"
+    cut = rng.randint(1, min(len(code) - 1, 8))
+    del code[len(code) - cut:]
+    return "truncation"
+
+
+def mutate_insertion(code: bytearray, rng: random.Random) -> str:
+    idx = rng.randrange(len(code) + 1)
+    num_bytes = rng.randint(1, 4)
+    inserted = [rng.randrange(256) for _ in range(num_bytes)]
+    code[idx:idx] = bytearray(inserted)
+    return "insertion"
+
+
+def mutate_deletion(code: bytearray, rng: random.Random) -> str:
+    if len(code) <= 1:
+        return "deletion"
+    idx = rng.randrange(len(code))
+    num_bytes = rng.randint(1, min(4, len(code) - idx))
+    del code[idx:idx + num_bytes]
+    return "deletion"
+
+
+MUTATION_OPS: List[Callable[[bytearray, random.Random], str]] = [
+    mutate_bit_flip,
+    mutate_byte_replace,
+    mutate_opcode_swap,
+    mutate_operand_corruption,
+    mutate_truncation,
+    mutate_insertion,
+    mutate_deletion,
+]
+
+
+def mutate_module(base: BCModule, rng: random.Random) -> Tuple[BCModule, str]:
+    """Clone module and apply a random mutation to one of its functions."""
+    cloned_funcs = []
+    for fn in base.functions:
+        cloned_funcs.append(BCFunction(
+            name=fn.name,
+            param_types=list(fn.param_types),
+            return_type=fn.return_type,
+            num_locals=fn.num_locals,
+            local_types=list(fn.local_types),
+            max_stack=fn.max_stack,
+            code=fn.code,
+        ))
+    mutant = BCModule(
+        version=base.version,
+        entry_func=base.entry_func,
+        functions=cloned_funcs,
+    )
+
+    fn = rng.choice(mutant.functions)
+
+    # 15% chance to mutate metadata (max_stack, num_locals, etc.)
+    if rng.random() < 0.15:
+        choice = rng.choice(["max_stack", "num_locals", "entry_func"])
+        if choice == "max_stack":
+            fn.max_stack = rng.choice([0, 1, fn.max_stack // 2, fn.max_stack + 5])
+            return mutant, "metadata_max_stack"
+        elif choice == "num_locals":
+            fn.num_locals = max(0, fn.num_locals + rng.choice([-1, -2, 1, 5]))
+            return mutant, "metadata_num_locals"
+        else:
+            mutant.entry_func = rng.choice([0, 1, 99])
+            return mutant, "metadata_entry_func"
+
+    # Otherwise mutate code bytes
+    code_arr = bytearray(fn.code)
+    mut_op = rng.choice(MUTATION_OPS)
+    op_name = mut_op(code_arr, rng)
+    fn.code = bytes(code_arr)
+    return mutant, op_name
+
+
+# ---------------------------------------------------------------------------
+# Fuzz Runner
+# ---------------------------------------------------------------------------
+
+def run_fuzzer(
+    examples_dir: Path,
+    num_mutations: int,
+    seed: int,
+    step_limit: int = 10000,
+    opt: bool = False,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Run the mutation fuzzer and return (records, summary)."""
+    rng = random.Random(seed)
+    records: List[Dict[str, Any]] = []
+
+    devnull = io.StringIO()
+
+    total_mutants = 0
+    accepted_count = 0
+    rejected_count = 0
+    rule_counts: Dict[str, int] = {}
+    unsafe_crashes = 0
+    soundness_violations = 0
+
+    for example_file in EXAMPLE_FILES:
+        filepath = examples_dir / example_file
+        if not filepath.exists():
+            continue
+
+        base_mod = load_seed_module(filepath)
+
+        for m_id in range(1, num_mutations + 1):
+            total_mutants += 1
+            mutant, mut_type = mutate_module(base_mod, rng)
+
+            # Step 1: Verify
+            verdict = "ACCEPTED"
+            rule_name = ""
+            try:
+                verify(mutant)
+            except VerifyError as ve:
+                verdict = "REJECTED"
+                rule_name = ve.rule
+                rule_counts[rule_name] = rule_counts.get(rule_name, 0) + 1
+            except Exception as e:
+                # Any unhandled exception from verifier itself is an error
+                verdict = "VERIFIER_ERROR"
+                rule_name = type(e).__name__
+
+            safe_status = "N/A"
+            unsafe_status = "N/A"
+            soundness_violation = False
+
+            if verdict == "ACCEPTED":
+                accepted_count += 1
+                # Run in safe mode
+                try:
+                    vm = VM(stdout=devnull)
+                    vm.run(mutant, max_steps=step_limit)
+                    safe_status = "CLEAN"
+                except VMTrap:
+                    safe_status = "VM_TRAP"
+                except TimeoutError:
+                    safe_status = "STEP_LIMIT"
+                except Exception as e:
+                    # An accepted program crashed with raw Python exception -> SOUNDNESS BUG!
+                    safe_status = f"CRASH_{type(e).__name__}"
+                    soundness_violation = True
+                    soundness_violations += 1
+
+                if opt and not soundness_violation:
+                    try:
+                        opt_mod = optimize_module(mutant)
+                        verify(opt_mod)
+                        vm_opt = VM(stdout=devnull)
+                        vm_opt.run(opt_mod, max_steps=step_limit)
+                        safe_status = "CLEAN_OPT"
+                    except VMTrap:
+                        safe_status = "VM_TRAP_OPT"
+                    except TimeoutError:
+                        safe_status = "STEP_LIMIT_OPT"
+                    except VerifyError as ve:
+                        safe_status = f"OPT_VERIFY_{ve.rule}"
+                        soundness_violation = True
+                        soundness_violations += 1
+                    except Exception as e:
+                        safe_status = f"OPT_CRASH_{type(e).__name__}"
+                        soundness_violation = True
+                        soundness_violations += 1
+
+            elif verdict == "REJECTED":
+                rejected_count += 1
+                # Run in unsafe mode
+                try:
+                    vm = VM(stdout=devnull)
+                    vm.run(mutant, max_steps=step_limit)
+                    unsafe_status = "COMPLETED"
+                except VMTrap:
+                    unsafe_status = "VM_TRAP"
+                except TimeoutError:
+                    unsafe_status = "STEP_LIMIT"
+                except Exception as e:
+                    unsafe_status = f"CRASH_{type(e).__name__}"
+                    unsafe_crashes += 1
+
+            records.append({
+                "program": example_file,
+                "mutant_id": m_id,
+                "mutation_type": mut_type,
+                "verdict": verdict,
+                "rule": rule_name,
+                "safe_status": safe_status,
+                "unsafe_status": unsafe_status,
+                "soundness_violation": soundness_violation,
+            })
+
+    summary = {
+        "total": total_mutants,
+        "accepted": accepted_count,
+        "rejected": rejected_count,
+        "rule_counts": rule_counts,
+        "unsafe_crashes": unsafe_crashes,
+        "soundness_violations": soundness_violations,
+    }
+
+    return records, summary
+
+
+def print_summary(summary: Dict[str, Any]):
+    print("=" * 60)
+    print("                FUZZING CAMPAIGN SUMMARY                ")
+    print("=" * 60)
+    print(f"Total Mutants Tested:       {summary['total']}")
+    print(f"Accepted by Verifier:       {summary['accepted']} ({summary['accepted'] / max(1, summary['total']):.1%})")
+    print(f"Rejected by Verifier:       {summary['rejected']} ({summary['rejected'] / max(1, summary['total']):.1%})")
+    print(f"Unsafe Mode Crashes:        {summary['unsafe_crashes']}")
+    print(f"Soundness Violations:       {summary['soundness_violations']}")
+    print("-" * 60)
+    print("Rejections Breakdown by Rule:")
+    for rule, count in sorted(summary["rule_counts"].items(), key=lambda x: -x[1]):
+        print(f"  {rule:<22s}: {count:>5d} ({count / max(1, summary['rejected']):.1%})")
+    print("=" * 60)
+    if summary["soundness_violations"] == 0:
+        print("[SUCCESS] Zero soundness violations! The verifier proved 100% sound.")
+    else:
+        print(f"[FAIL] Found {summary['soundness_violations']} soundness violations!")
+    print("=" * 60)
+
+
+def save_csv(records: List[Dict[str, Any]], out_path: Path):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "program",
+        "mutant_id",
+        "mutation_type",
+        "verdict",
+        "rule",
+        "safe_status",
+        "unsafe_status",
+        "soundness_violation",
+    ]
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(records)
+    print(f"Saved results CSV to {out_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Secure Bytecode VM Fuzzer")
+    parser.add_argument("-n", "--iterations", type=int, default=100,
+                        help="Number of mutations per seed program (default: 100)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
+    parser.add_argument("--output", type=str, default="results/fuzz_results.csv",
+                        help="Path to output CSV (default: results/fuzz_results.csv)")
+    parser.add_argument("--examples", type=str, default="examples",
+                        help="Directory containing valid .ml examples")
+    parser.add_argument("--step-limit", type=int, default=10000,
+                        help="Maximum VM execution steps per test (default: 10000)")
+    parser.add_argument("--opt", action="store_true",
+                        help="Enable optimizer on accepted mutants and verify/run them")
+
+    args = parser.parse_args()
+
+    records, summary = run_fuzzer(
+        examples_dir=Path(args.examples),
+        num_mutations=args.iterations,
+        seed=args.seed,
+        step_limit=args.step_limit,
+        opt=args.opt,
+    )
+
+    print_summary(summary)
+    save_csv(records, Path(args.output))
+
+    if summary["soundness_violations"] > 0:
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
+===== FILE: tools/bench.py =====
+#!/usr/bin/env python3
+"""Benchmark suite for Secure Bytecode VM: verification scaling, verifier overhead, and optimizer impact.
+
+Benchmarks:
+1. Verification time vs bytecode size (generated programs of increasing size).
+2. VM execution time with vs without static verifier (measuring verification overhead).
+3. VM execution time with vs without optimizer (measuring size reduction and speedup).
+
+Outputs:
+  - Text summary tables to stdout.
+  - CSV results to results/bench.csv.
+  - Graphical plots to results/bench.png (using matplotlib).
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+# Add project root to sys.path
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from minilang.parser import parse
+from semantic import analyze
+from codegen import generate, BCFunction, BCModule, Op
+from optimizer import optimize_module
+from verifier import verify
+from vm import VM
+
+
+# ---------------------------------------------------------------------------
+# Benchmark 1: Verification Time vs Bytecode Size
+# ---------------------------------------------------------------------------
+
+def generate_sized_program(num_statements: int) -> str:
+    """Generate a valid MiniLang program with a specified number of statements."""
+    lines = ["func main(): int {", "    let s: int = 0;"]
+    for i in range(num_statements):
+        val = (i * 7 + 3) % 100
+        lines.append(f"    s = s + {val};")
+    lines.append("    return s;")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def bench_verification_scaling(statement_counts: List[int]) -> List[Dict[str, Any]]:
+    results = []
+    print("\n--- 1. Verification Scaling Benchmark ---")
+    print(f"{'Stmts':>8s} | {'Size (bytes)':>14s} | {'Verify Time (ms)':>18s} | {'Throughput (KB/s)':>18s}")
+    print("-" * 66)
+
+    for count in statement_counts:
+        src = generate_sized_program(count)
+        prog = parse(src)
+        st = analyze(prog)
+        fns = generate(prog, st)
+        entry = next(i for i, f in enumerate(fns) if f.name == "main")
+        mod = BCModule(version=1, entry_func=entry, functions=fns)
+
+        total_bytes = sum(len(f.code) for f in mod.functions)
+
+        # Warm-up
+        verify(mod)
+
+        # Timed runs
+        iterations = 20 if count < 1000 else 5
+        start_ns = time.perf_counter_ns()
+        for _ in range(iterations):
+            verify(mod)
+        elapsed_ms = (time.perf_counter_ns() - start_ns) / (iterations * 1_000_000)
+
+        throughput_kb_s = (total_bytes / 1024) / (elapsed_ms / 1000) if elapsed_ms > 0 else 0
+
+        print(f"{count:>8d} | {total_bytes:>14d} | {elapsed_ms:>18.4f} | {throughput_kb_s:>18.1f}")
+
+        results.append({
+            "category": "verification_scaling",
+            "name": f"scale_{count}_stmts",
+            "statements": count,
+            "bytecode_bytes": total_bytes,
+            "verify_time_ms": elapsed_ms,
+            "throughput_kb_s": throughput_kb_s,
+        })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Benchmark 2: VM Run Time With vs Without Verifier
+# ---------------------------------------------------------------------------
+
+BENCHMARK_PROGRAMS = {
+    "Factorial": """\
+func fact(n: int): int {
+    if (n <= 1) { return 1; }
+    return n * fact(n - 1);
+}
+func main(): int {
+    let i: int = 0;
+    let r: int = 0;
+    while (i < 500) {
+        r = fact(10);
+        i = i + 1;
+    }
+    return r;
+}
+""",
+    "Fibonacci": """\
+func fib(n: int): int {
+    let a: int = 0;
+    let b: int = 1;
+    let i: int = 0;
+    while (i < n) {
+        let t: int = a + b;
+        a = b;
+        b = t;
+        i = i + 1;
+    }
+    return a;
+}
+func main(): int {
+    let i: int = 0;
+    let r: int = 0;
+    while (i < 500) {
+        r = fib(25);
+        i = i + 1;
+    }
+    return r;
+}
+""",
+    "GCD Loop": """\
+func gcd(a: int, b: int): int {
+    while (b != 0) {
+        let t: int = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
+}
+func main(): int {
+    let i: int = 0;
+    let r: int = 0;
+    while (i < 1000) {
+        r = gcd(1071, 462);
+        i = i + 1;
+    }
+    return r;
+}
+""",
+    "Prime Sieve": """\
+func is_prime(n: int): bool {
+    if (n < 2) { return false; }
+    let d: int = 2;
+    while (d * d <= n) {
+        if (n % d == 0) { return false; }
+        d = d + 1;
+    }
+    return true;
+}
+func main(): int {
+    let count: int = 0;
+    let k: int = 2;
+    while (k < 300) {
+        if (is_prime(k)) { count = count + 1; }
+        k = k + 1;
+    }
+    return count;
+}
+""",
+}
+
+
+def bench_verifier_overhead() -> List[Dict[str, Any]]:
+    results = []
+    print("\n--- 2. VM Run Time With vs Without Verifier ---")
+    print(f"{'Program':<14s} | {'VM Only (ms)':>14s} | {'Verify (ms)':>14s} | {'Total (ms)':>14s} | {'Overhead (%)':>14s}")
+    print("-" * 76)
+
+    devnull = io.StringIO()
+
+    for name, src in BENCHMARK_PROGRAMS.items():
+        prog = parse(src)
+        st = analyze(prog)
+        fns = generate(prog, st)
+        entry = next(i for i, f in enumerate(fns) if f.name == "main")
+        mod = BCModule(version=1, entry_func=entry, functions=fns)
+
+        # Warm-up
+        VM(stdout=devnull).run(mod)
+        verify(mod)
+
+        # Measure verification time
+        v_runs = 20
+        v_start = time.perf_counter_ns()
+        for _ in range(v_runs):
+            verify(mod)
+        v_time_ms = (time.perf_counter_ns() - v_start) / (v_runs * 1_000_000)
+
+        # Measure VM execution time without verification
+        r_runs = 10
+        r_start = time.perf_counter_ns()
+        for _ in range(r_runs):
+            VM(stdout=devnull).run(mod)
+        vm_time_ms = (time.perf_counter_ns() - r_start) / (r_runs * 1_000_000)
+
+        total_with_verify = vm_time_ms + v_time_ms
+        overhead_pct = (v_time_ms / vm_time_ms) * 100 if vm_time_ms > 0 else 0
+
+        print(f"{name:<14s} | {vm_time_ms:>14.3f} | {v_time_ms:>14.4f} | {total_with_verify:>14.3f} | {overhead_pct:>13.2f}%")
+
+        results.append({
+            "category": "verifier_overhead",
+            "name": name,
+            "vm_time_ms": vm_time_ms,
+            "verify_time_ms": v_time_ms,
+            "total_time_ms": total_with_verify,
+            "overhead_pct": overhead_pct,
+        })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Benchmark 3: With vs Without Optimizer
+# ---------------------------------------------------------------------------
+
+OPTIMIZER_PROGRAMS = {
+    "Constant Arithmetic": """\
+func main(): int {
+    let i: int = 0;
+    let acc: int = 0;
+    while (i < 1000) {
+        acc = acc + (1 + 2 * 3 - (4 + 5));
+        i = i + 1;
+    }
+    return acc;
+}
+""",
+    "Unused Computations": """\
+func main(): int {
+    let i: int = 0;
+    let s: int = 0;
+    while (i < 1000) {
+        100 + 200;
+        !(!true);
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+""",
+    "Factorial (500x)": BENCHMARK_PROGRAMS["Factorial"],
+    "GCD Loop (1000x)": BENCHMARK_PROGRAMS["GCD Loop"],
+}
+
+
+def bench_optimizer_impact() -> List[Dict[str, Any]]:
+    results = []
+    print("\n--- 3. With vs Without Optimizer ---")
+    print(f"{'Program':<22s} | {'Unopt (B)':>10s} | {'Opt (B)':>8s} | {'Saved (%)':>10s} | {'Unopt (ms)':>11s} | {'Opt (ms)':>9s} | {'Speedup':>9s}")
+    print("-" * 88)
+
+    devnull = io.StringIO()
+
+    for name, src in OPTIMIZER_PROGRAMS.items():
+        prog = parse(src)
+        st = analyze(prog)
+        fns = generate(prog, st)
+        entry = next(i for i, f in enumerate(fns) if f.name == "main")
+        mod_unopt = BCModule(version=1, entry_func=entry, functions=fns)
+        mod_opt = optimize_module(mod_unopt)
+
+        size_unopt = sum(len(f.code) for f in mod_unopt.functions)
+        size_opt = sum(len(f.code) for f in mod_opt.functions)
+        size_saved_pct = ((size_unopt - size_opt) / size_unopt) * 100 if size_unopt > 0 else 0
+
+        # Measure run time unoptimized
+        runs = 10
+        t0 = time.perf_counter_ns()
+        for _ in range(runs):
+            VM(stdout=devnull).run(mod_unopt)
+        time_unopt = (time.perf_counter_ns() - t0) / (runs * 1_000_000)
+
+        # Measure run time optimized
+        t1 = time.perf_counter_ns()
+        for _ in range(runs):
+            VM(stdout=devnull).run(mod_opt)
+        time_opt = (time.perf_counter_ns() - t1) / (runs * 1_000_000)
+
+        speedup = time_unopt / time_opt if time_opt > 0 else 1.0
+
+        print(f"{name:<22s} | {size_unopt:>10d} | {size_opt:>8d} | {size_saved_pct:>9.1f}% | {time_unopt:>11.3f} | {time_opt:>9.3f} | {speedup:>8.2f}x")
+
+        results.append({
+            "category": "optimizer_impact",
+            "name": name,
+            "unopt_bytes": size_unopt,
+            "opt_bytes": size_opt,
+            "size_saved_pct": size_saved_pct,
+            "unopt_time_ms": time_unopt,
+            "opt_time_ms": time_opt,
+            "speedup": speedup,
+        })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Plotting & CSV Export
+# ---------------------------------------------------------------------------
+
+def save_csv_results(all_results: List[Dict[str, Any]], out_path: Path):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    all_keys = set()
+    for row in all_results:
+        all_keys.update(row.keys())
+    fieldnames = ["category", "name"] + sorted(k for k in all_keys if k not in ("category", "name"))
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_results)
+    print(f"\nSaved benchmark results to {out_path}")
+
+
+def generate_plots(scaling: List[Dict[str, Any]],
+                   overhead: List[Dict[str, Any]],
+                   optimizer: List[Dict[str, Any]],
+                   out_path: Path):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[Notice] matplotlib is not available; skipping plot generation.")
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.patch.set_facecolor("#f8f9fa")
+
+    # Plot 1: Verification Time vs Bytecode Size
+    ax1 = axes[0]
+    sizes = [row["bytecode_bytes"] for row in scaling]
+    v_times = [row["verify_time_ms"] for row in scaling]
+    ax1.plot(sizes, v_times, marker="o", color="#1f77b4", linewidth=2, markersize=6)
+    ax1.set_title("Verification Time vs Bytecode Size", fontsize=12, fontweight="bold")
+    ax1.set_xlabel("Bytecode Size (bytes)", fontsize=10)
+    ax1.set_ylabel("Verification Time (ms)", fontsize=10)
+    ax1.grid(True, linestyle="--", alpha=0.6)
+
+    # Plot 2: VM Execution vs Verification Overhead
+    ax2 = axes[1]
+    prog_names = [row["name"] for row in overhead]
+    vm_times = [row["vm_time_ms"] for row in overhead]
+    ver_times = [row["verify_time_ms"] for row in overhead]
+    x_indices = range(len(prog_names))
+    width = 0.35
+
+    ax2.bar([x - width/2 for x in x_indices], vm_times, width=width, label="VM Runtime", color="#2ca02c")
+    ax2.bar([x + width/2 for x in x_indices], ver_times, width=width, label="Verifier Time", color="#d62728")
+    ax2.set_xticks(list(x_indices))
+    ax2.set_xticklabels(prog_names, rotation=15, ha="right", fontsize=9)
+    ax2.set_title("VM Runtime vs Verification Time", fontsize=12, fontweight="bold")
+    ax2.set_ylabel("Time (ms)", fontsize=10)
+    ax2.legend(fontsize=9)
+    ax2.grid(True, linestyle="--", alpha=0.6, axis="y")
+
+    # Plot 3: Optimizer Speedup & Bytecode Reduction
+    ax3 = axes[2]
+    opt_names = [row["name"] for row in optimizer]
+    unopt_ms = [row["unopt_time_ms"] for row in optimizer]
+    opt_ms = [row["opt_time_ms"] for row in optimizer]
+    x_indices3 = range(len(opt_names))
+
+    ax3.bar([x - width/2 for x in x_indices3], unopt_ms, width=width, label="Unoptimized", color="#7f7f7f")
+    ax3.bar([x + width/2 for x in x_indices3], opt_ms, width=width, label="Optimized", color="#ff7f0e")
+    ax3.set_xticks(list(x_indices3))
+    ax3.set_xticklabels(opt_names, rotation=15, ha="right", fontsize=9)
+    ax3.set_title("Execution Time: Unopt vs Opt", fontsize=12, fontweight="bold")
+    ax3.set_ylabel("Execution Time (ms)", fontsize=10)
+    ax3.legend(fontsize=9)
+    ax3.grid(True, linestyle="--", alpha=0.6, axis="y")
+
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+    print(f"Saved benchmark plot to {out_path}")
+
+
+def main():
+    statement_counts = [20, 50, 100, 250, 500, 1000]
+
+    scaling_results = bench_verification_scaling(statement_counts)
+    overhead_results = bench_verifier_overhead()
+    optimizer_results = bench_optimizer_impact()
+
+    all_results = scaling_results + overhead_results + optimizer_results
+
+    csv_path = Path("results/bench.csv")
+    png_path = Path("results/bench.png")
+
+    save_csv_results(all_results, csv_path)
+    generate_plots(scaling_results, overhead_results, optimizer_results, png_path)
+
+
+if __name__ == "__main__":
+    main()
+===== FILE: tests/malicious/generate_malicious.py =====
+"""Generate crafted malicious .bc files for all 13 verifier rules."""
+
+import struct
+from pathlib import Path
+
+from codegen.generator import BCFunction
+from codegen.opcodes import Op
+from codegen.serializer import BCModule, write_bytecode
+from verifier import verify, VerifyError
+
+
+def push_int(v: int) -> bytes:
+    return bytes([Op.PUSH_INT]) + struct.pack("<i", v)
+
+
+def push_bool(v: bool) -> bytes:
+    return bytes([Op.PUSH_BOOL, 1 if v else 0])
+
+
+def pop() -> bytes:
+    return bytes([Op.POP])
+
+
+def dup() -> bytes:
+    return bytes([Op.DUP])
+
+
+def add() -> bytes:
+    return bytes([Op.ADD])
+
+
+def and_() -> bytes:
+    return bytes([Op.AND])
+
+
+def load(idx: int) -> bytes:
+    return bytes([Op.LOAD]) + struct.pack("<H", idx)
+
+
+def store(idx: int) -> bytes:
+    return bytes([Op.STORE]) + struct.pack("<H", idx)
+
+
+def jmp(target: int) -> bytes:
+    return bytes([Op.JMP]) + struct.pack("<H", target)
+
+
+def jmp_if_false(target: int) -> bytes:
+    return bytes([Op.JMP_IF_FALSE]) + struct.pack("<H", target)
+
+
+def call(func_idx: int) -> bytes:
+    return bytes([Op.CALL]) + struct.pack("<H", func_idx)
+
+
+def ret() -> bytes:
+    return bytes([Op.RET])
+
+
+def make_fn(name="main", param_types=None, return_type="int",
+            num_locals=None, local_types=None, max_stack=10, code=b"") -> BCFunction:
+    param_types = param_types or []
+    if local_types is None:
+        local_types = list(param_types)
+    if num_locals is None:
+        num_locals = len(local_types)
+    return BCFunction(name, param_types, return_type, num_locals, local_types, max_stack, code)
+
+
+def make_module(functions=None, entry_func=0) -> BCModule:
+    if functions is None:
+        functions = [make_fn(code=push_int(0) + ret())]
+    return BCModule(version=1, entry_func=entry_func, functions=functions)
+
+
+def build_malicious_files(output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    files = {
+        # 1. BAD_OPCODE
+        "bad_opcode_1.bc": (
+            make_module([make_fn(code=bytes([0xEE]) + push_int(0) + ret())]),
+            "BAD_OPCODE",
+            "Unknown opcode byte 0xEE"
+        ),
+        "bad_opcode_2.bc": (
+            make_module([make_fn(code=bytes([Op.PUSH_BOOL, 2]) + pop() + push_int(0) + ret())]),
+            "BAD_OPCODE",
+            "PUSH_BOOL with invalid operand 2 (must be 0 or 1)"
+        ),
+
+        # 2. TRUNCATED
+        "truncated_1.bc": (
+            make_module([make_fn(code=bytes([Op.PUSH_INT, 0x01, 0x02]))]),
+            "TRUNCATED",
+            "PUSH_INT instruction truncated (needs 4 operand bytes, has 2)"
+        ),
+        "truncated_2.bc": (
+            make_module([make_fn(code=push_int(0) + bytes([Op.STORE, 0x00]))]),
+            "TRUNCATED",
+            "STORE instruction truncated (needs 2 operand bytes, has 1)"
+        ),
+
+        # 3. BAD_JUMP
+        "bad_jump_1.bc": (
+            make_module([make_fn(code=jmp(100) + push_int(0) + ret())]),
+            "BAD_JUMP",
+            "JMP target 100 exceeds code bounds"
+        ),
+        "bad_jump_2.bc": (
+            make_module([make_fn(code=push_int(42) + jmp(2) + ret())]),
+            "BAD_JUMP",
+            "JMP target 2 jumps into the middle of PUSH_INT operand"
+        ),
+
+        # 4. STACK_UNDERFLOW
+        "stack_underflow_1.bc": (
+            make_module([make_fn(code=pop() + push_int(0) + ret())]),
+            "STACK_UNDERFLOW",
+            "POP executed on empty operand stack"
+        ),
+        "stack_underflow_2.bc": (
+            make_module([make_fn(code=push_int(1) + add() + ret())]),
+            "STACK_UNDERFLOW",
+            "ADD requires 2 stack operands, but only 1 is present"
+        ),
+
+        # 5. STACK_OVERFLOW
+        "stack_overflow_1.bc": (
+            make_module([make_fn(max_stack=1, code=push_int(1) + push_int(2) + pop() + ret())]),
+            "STACK_OVERFLOW",
+            "Second PUSH_INT causes stack depth 2 to exceed declared max_stack=1"
+        ),
+        "stack_overflow_2.bc": (
+            make_module([make_fn(max_stack=2, code=push_int(1) + dup() + dup() + pop() + pop() + ret())]),
+            "STACK_OVERFLOW",
+            "Second DUP causes stack depth 3 to exceed declared max_stack=2"
+        ),
+
+        # 6. STACK_TYPE
+        "stack_type_1.bc": (
+            make_module([make_fn(code=push_bool(True) + push_int(1) + add() + ret())]),
+            "STACK_TYPE",
+            "ADD executed with bool and int operands (expects [int, int])"
+        ),
+        "stack_type_2.bc": (
+            make_module([make_fn(code=push_int(1) + push_int(2) + and_() + pop() + push_int(0) + ret())]),
+            "STACK_TYPE",
+            "AND executed with int operands (expects [bool, bool])"
+        ),
+
+        # 7. MERGE_MISMATCH
+        "merge_mismatch_1.bc": (
+            make_module([make_fn(code=push_bool(True) + jmp_if_false(10) + push_int(1) + ret())]),
+            "MERGE_MISMATCH",
+            "Control flow join at RET has stack depth 1 from then-branch, depth 0 from else-branch"
+        ),
+        "merge_mismatch_2.bc": (
+            make_module([make_fn(code=(push_bool(True) + jmp_if_false(13) +
+                                       push_int(1) + jmp(15) +
+                                       push_bool(False) + ret()))]),
+            "MERGE_MISMATCH",
+            "Control flow join at RET has stack slot 0 type int from then-branch, bool from else-branch"
+        ),
+
+        # 8. LOCAL_RANGE
+        "local_range_1.bc": (
+            make_module([make_fn(num_locals=1, local_types=["int"], code=load(10) + ret())]),
+            "LOCAL_RANGE",
+            "LOAD accessed local index 10 when num_locals=1"
+        ),
+        "local_range_2.bc": (
+            make_module([make_fn(num_locals=1, local_types=["int"], code=push_int(0) + store(10) + push_int(0) + ret())]),
+            "LOCAL_RANGE",
+            "STORE accessed local index 10 when num_locals=1"
+        ),
+
+        # 9. LOCAL_TYPE
+        "local_type_1.bc": (
+            make_module([make_fn(num_locals=1, local_types=["int"], code=push_bool(True) + store(0) + push_int(0) + ret())]),
+            "LOCAL_TYPE",
+            "STORE popped bool value into local 0 declared as int"
+        ),
+        "local_type_2.bc": (
+            make_module([make_fn(num_locals=1, local_types=["bool"], code=push_int(42) + store(0) + push_int(0) + ret())]),
+            "LOCAL_TYPE",
+            "STORE popped int value into local 0 declared as bool"
+        ),
+
+        # 10. LOCAL_UNSET
+        "local_unset_1.bc": (
+            make_module([make_fn(num_locals=1, local_types=["int"], code=load(0) + ret())]),
+            "LOCAL_UNSET",
+            "LOAD accessed local 0 before it was assigned (UNSET)"
+        ),
+        "local_unset_2.bc": (
+            make_module([make_fn(num_locals=1, local_types=["int"],
+                                code=(push_bool(True) + jmp_if_false(13) +
+                                      push_int(42) + store(0) +
+                                      load(0) + ret()))]),
+            "LOCAL_UNSET",
+            "LOAD accessed local 0 which is UNSET along the false branch"
+        ),
+
+        # 11. BAD_CALL
+        "bad_call_1.bc": (
+            make_module([make_fn(code=call(10) + ret())]),
+            "BAD_CALL",
+            "CALL target function index 10 does not exist in function table"
+        ),
+        "bad_call_2.bc": (
+            make_module([
+                make_fn(name="main", return_type="int", code=push_int(42) + call(1) + ret()),
+                make_fn(name="helper", param_types=["bool"], return_type="int",
+                        num_locals=1, local_types=["bool"], code=push_int(0) + ret()),
+            ]),
+            "BAD_CALL",
+            "CALL passed argument of type int to function expecting bool"
+        ),
+
+        # 12. BAD_RETURN
+        "bad_return_1.bc": (
+            make_module([make_fn(return_type="int", code=push_bool(True) + ret())]),
+            "BAD_RETURN",
+            "RET returned bool when function is declared to return int"
+        ),
+        "bad_return_2.bc": (
+            make_module([
+                make_fn(name="main", return_type="int", code=push_int(0) + ret()),
+                make_fn(name="helper", return_type="bool", code=push_int(42) + ret()),
+            ]),
+            "BAD_RETURN",
+            "RET in helper returned int when helper is declared to return bool"
+        ),
+
+        # 13. FALLTHROUGH
+        "fallthrough_1.bc": (
+            make_module([make_fn(num_locals=1, local_types=["int"], code=push_int(42) + store(0))]),
+            "FALLTHROUGH",
+            "Code falls off the end of instruction stream without RET, JMP, or HALT"
+        ),
+        "fallthrough_2.bc": (
+            make_module([make_fn(code=push_bool(True) + jmp_if_false(0))]),
+            "FALLTHROUGH",
+            "JMP_IF_FALSE falls through past the end of the code stream"
+        ),
+    }
+
+    readme_lines = [
+        "# Malicious Bytecode Test Suite",
+        "",
+        "This directory contains crafted `.bc` bytecode files designed to test every static verifier rule.",
+        "Each file isolates and violates exactly one rule from `docs/VERIFIER_DESIGN.md`.",
+        "",
+        "| File | Expected Rule | Description |",
+        "|---|---|---|",
+    ]
+
+    for fname, (mod, rule, desc) in sorted(files.items()):
+        fpath = output_dir / fname
+        write_bytecode(fpath, mod.functions, mod.entry_func)
+
+        # Verify that it indeed triggers the expected rule
+        try:
+            verify(mod)
+            raise AssertionError(f"Expected {fname} to fail with {rule}, but verification passed!")
+        except VerifyError as e:
+            assert e.rule == rule, f"{fname}: expected {rule}, got {e.rule}: {e}"
+
+        readme_lines.append(f"| `{fname}` | `{rule}` | {desc} |")
+
+    readme_path = output_dir / "README.md"
+    readme_path.write_text("\n".join(readme_lines) + "\n", encoding="utf-8")
+    print(f"Generated {len(files)} malicious bytecode files and README.md in {output_dir}")
+
+
+if __name__ == "__main__":
+    build_malicious_files(Path(__file__).parent)
+===== COMMAND: git log --oneline --decorate -n 30 =====
+ef3a16a (HEAD -> main, tag: final-v2, origin/main) feat: merge hardening fixes, bounds checks, and regression tests
+46e9f00 (fix/hardening) docs(hardening): update 15,000-mutant results, exact commands, and audit report self-audit title
+d8fca3c test(hardening): regression test suite for malformed binaries, literal bounds, lexer ASCII checks, and fuzz with opt
+7c96ae7 feat(hardening): ASCII validation in lexer/serializer, literal bounds checking, and verify-before-opt CLI pipeline
+532de99 (tag: final) docs: add comprehensive final audit report and updated fuzzing results
+c13fe8b feat: merge optimizer, benchmarks, and final documentation (Final Phase)
+82abae0 (origin/feature/final, feature/final) docs: update status table, add CLI usage instructions, and comprehensive results report
+62a3621 feat(bench): benchmarking suite for verification scaling, overhead, and optimizer impact
+2d27a0b test(optimizer): tests for constant folding, peephole rules, examples, and CLI
+772e48f feat(cli): add optimize command and --opt flag support
+90f94f4 feat(optimizer): bytecode constant folding, peephole optimizations, and jump recalculation
+ea162fb (tag: review-3) feat: merge fuzzing framework and malicious suite (Review 3)
+967f71f feat: merge static verifier (Review 3)
+386441d (origin/feature/fuzzing, feature/fuzzing) docs(demo): add demo scripts and document fuzzing evaluation findings
+f2ed14e feat(fuzzing): differential mutation fuzzer and evaluation results
+8d11322 test(malicious): add 26 crafted malicious bytecode files to tests/malicious
+d148fcd test(verifier): crafted malicious bytecode test suite and README
+a0f1c1e feat(vm): add max_steps step limit support to interpreter
+ca9143f (origin/feature/verifier, feature/verifier) test(verifier): comprehensive tests for all 13 rules, valid examples, and CLI
+48966a9 feat(cli): integrate verifier with VM loader and add verify command
+c3ae9f9 feat(verifier): worklist abstract interpreter and type/bounds checks
+66470bf feat(verifier): abstract lattice state and join merge rules (MERGE_MISMATCH)
+5e57461 feat(verifier): control flow analysis and jump validation (BAD_JUMP, FALLTHROUGH)
+6ad8149 feat(verifier): instruction decoder and format validation (BAD_OPCODE, TRUNCATED)
+a7fa000 (tag: review-2) feat: merge bytecode virtual machine interpreter (Review 2)
+cc73587 feat: merge code generator, serializer, and disassembler (Review 2)
+b5c0cd9 (origin/feature/vm, feature/vm) test(vm): end-to-end tests for examples, wraparound, VMTrap, and CLI
+f7afe5c feat(cli): add run command with --unsafe flag to svm.py
+471d7ce feat(vm): interpreter with frames, call/ret, print, wraparound, and VMTrap
+1bf9b42 (origin/feature/codegen, feature/codegen) test(codegen): serialize roundtrip, disassembly, jump targets, and max_stack
+===== COMMAND: git tag =====
+final
+final-v2
+review-1
+review-2
+review-3
+===== COMMAND: git status --short =====
+?? review_bundle.txt
+===== COMMAND: python tools/fuzz.py --help =====
+usage: fuzz.py [-h] [-n ITERATIONS] [--seed SEED] [--output OUTPUT]
+               [--examples EXAMPLES] [--step-limit STEP_LIMIT] [--opt]
+
+Secure Bytecode VM Fuzzer
+
+options:
+  -h, --help            show this help message and exit
+  -n ITERATIONS, --iterations ITERATIONS
+                        Number of mutations per seed program (default: 100)
+  --seed SEED           Random seed for reproducibility (default: 42)
+  --output OUTPUT       Path to output CSV (default: results/fuzz_results.csv)
+  --examples EXAMPLES   Directory containing valid .ml examples
+  --step-limit STEP_LIMIT
+                        Maximum VM execution steps per test (default: 10000)
+  --opt                 Enable optimizer on accepted mutants and verify/run
+                        them
+===== COMMAND: python tools/bench.py --help =====
+
+--- 1. Verification Scaling Benchmark ---
+   Stmts |   Size (bytes) |   Verify Time (ms) |  Throughput (KB/s)
+------------------------------------------------------------------
+      20 |            252 |             0.7614 |              323.2
+      50 |            612 |             2.0931 |              285.5
+     100 |           1212 |             5.7100 |              207.3
+     250 |           3012 |            12.0915 |              243.3
+     500 |           6012 |            25.9689 |              226.1
+    1000 |          12012 |            49.3274 |              237.8
+
+--- 2. VM Run Time With vs Without Verifier ---
+Program        |   VM Only (ms) |    Verify (ms) |     Total (ms) |   Overhead (%)
+----------------------------------------------------------------------------
+Factorial      |        382.668 |         0.4546 |        383.122 |          0.12%
+Fibonacci      |       1621.775 |         0.5893 |       1622.365 |          0.04%
+GCD Loop       |        371.059 |         0.5511 |        371.610 |          0.15%
+Prime Sieve    |        140.567 |         0.6587 |        141.226 |          0.47%
+
+--- 3. With vs Without Optimizer ---
+Program                |  Unopt (B) |  Opt (B) |  Saved (%) |  Unopt (ms) |  Opt (ms) |   Speedup
+----------------------------------------------------------------------------------------
+Constant Arithmetic    |         83 |       59 |      28.9% |      83.843 |    64.976 |     1.29x
+Unused Computations    |         74 |       57 |      23.0% |     104.233 |    66.848 |     1.56x
+Factorial (500x)       |         93 |       93 |       0.0% |     353.339 |   339.071 |     1.04x
+GCD Loop (1000x)       |        104 |      104 |       0.0% |     403.481 |   420.108 |     0.96x
+
+Saved benchmark results to results\bench.csv
+Saved benchmark plot to results\bench.png
+===== COMMAND: python -m unittest discover -s tests -t . =====
+........................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 168 tests in 6.655s
+
+OK
+===== COMMAND: the first 15 lines of results/fuzz_results.csv =====
+program,mutant_id,mutation_type,verdict,rule,safe_status,unsafe_status,soundness_violation
+factorial.ml,1,insertion,REJECTED,BAD_OPCODE,N/A,CRASH_IndexError,False
+factorial.ml,2,operand_corruption,ACCEPTED,,CLEAN,N/A,False
+factorial.ml,3,bit_flip,ACCEPTED,,CLEAN,N/A,False
+factorial.ml,4,bit_flip,ACCEPTED,,CLEAN,N/A,False
+factorial.ml,5,bit_flip,ACCEPTED,,STEP_LIMIT,N/A,False
+factorial.ml,6,metadata_max_stack,REJECTED,STACK_OVERFLOW,N/A,COMPLETED,False
+factorial.ml,7,deletion,REJECTED,FALLTHROUGH,N/A,CRASH_IndexError,False
+factorial.ml,8,insertion,REJECTED,BAD_OPCODE,N/A,CRASH_IndexError,False
+factorial.ml,9,operand_corruption,REJECTED,BAD_OPCODE,N/A,CRASH_IndexError,False
+factorial.ml,10,deletion,REJECTED,BAD_OPCODE,N/A,CRASH_ValueError,False
+factorial.ml,11,operand_corruption,REJECTED,BAD_OPCODE,N/A,CRASH_IndexError,False
+factorial.ml,12,insertion,REJECTED,BAD_JUMP,N/A,COMPLETED,False
+factorial.ml,13,insertion,REJECTED,BAD_OPCODE,N/A,CRASH_IndexError,False
+factorial.ml,14,metadata_num_locals,REJECTED,LOCAL_RANGE,N/A,COMPLETED,False
+===== COMMAND: a directory listing of results/ with file sizes =====
+
+
+    Directory: C:\Users\dhyan\OneDrive\Desktop\Projects\VeriByte\results
+
+
+Mode                 LastWriteTime         Length Name                                                                 
+----                 -------------         ------ ----                                                                 
+-a----        07-10-2026     20:19           1433 bench.csv                                                            
+-a----        07-10-2026     20:19         214118 bench.png                                                            
+-a---l        07-10-2026     01:58         350909 fuzz_results.csv                                                     
+
+

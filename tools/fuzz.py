@@ -20,10 +20,10 @@ import argparse
 import copy
 import csv
 import io
-import os
 import random
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 # Add project root to sys.path so modules can be imported when running script directly
@@ -34,11 +34,11 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from minilang.parser import parse
 from semantic import analyze
-from codegen import generate, serialize, load_bytecode, BCFunction, BCModule, Op
+from codegen import generate, serialize, load_bytecode, BCFunction, BCModule, BytecodeFormatError, Op
 from codegen.opcodes import OPERAND_SIZE
 from optimizer import optimize_module
 from verifier import verify, VerifyError
-from vm import VM, VMTrap
+from vm import VM, VMTrap, VMInvariantError
 
 
 # ---------------------------------------------------------------------------
@@ -182,18 +182,53 @@ def mutate_module(base: BCModule, rng: random.Random) -> Tuple[BCModule, str]:
 
     fn = rng.choice(mutant.functions)
 
-    # 15% chance to mutate metadata (max_stack, num_locals, etc.)
-    if rng.random() < 0.15:
-        choice = rng.choice(["max_stack", "num_locals", "entry_func"])
+    # 25% chance to mutate metadata or module structure
+    if rng.random() < 0.25:
+        choice = rng.choice([
+            "max_stack", "num_locals", "entry_func",
+            "param_types", "return_type", "local_types", "function_order_count",
+        ])
         if choice == "max_stack":
             fn.max_stack = rng.choice([0, 1, fn.max_stack // 2, fn.max_stack + 5])
             return mutant, "metadata_max_stack"
         elif choice == "num_locals":
             fn.num_locals = max(0, fn.num_locals + rng.choice([-1, -2, 1, 5]))
             return mutant, "metadata_num_locals"
-        else:
+        elif choice == "entry_func":
             mutant.entry_func = rng.choice([0, 1, 99])
             return mutant, "metadata_entry_func"
+        elif choice == "param_types":
+            sub = rng.choice(["flip", "add", "del"])
+            if sub == "flip" and fn.param_types:
+                idx = rng.randrange(len(fn.param_types))
+                fn.param_types[idx] = "bool" if fn.param_types[idx] == "int" else "int"
+            elif sub == "add":
+                fn.param_types.append(rng.choice(["int", "bool"]))
+            elif sub == "del" and fn.param_types:
+                fn.param_types.pop()
+            return mutant, "mutate_param_types"
+        elif choice == "return_type":
+            fn.return_type = "bool" if fn.return_type == "int" else "int"
+            return mutant, "mutate_return_type"
+        elif choice == "local_types":
+            sub = rng.choice(["flip", "add", "del"])
+            if sub == "flip" and fn.local_types:
+                idx = rng.randrange(len(fn.local_types))
+                fn.local_types[idx] = "bool" if fn.local_types[idx] == "int" else "int"
+            elif sub == "add":
+                fn.local_types.append(rng.choice(["int", "bool"]))
+            elif sub == "del" and fn.local_types:
+                fn.local_types.pop()
+            return mutant, "mutate_local_types"
+        elif choice == "function_order_count":
+            sub = rng.choice(["shuffle", "dup", "remove"])
+            if sub == "shuffle" and len(mutant.functions) > 1:
+                rng.shuffle(mutant.functions)
+            elif sub == "dup":
+                mutant.functions.append(copy.deepcopy(fn))
+            elif sub == "remove" and len(mutant.functions) > 1:
+                del mutant.functions[rng.randrange(len(mutant.functions))]
+            return mutant, "mutate_func_order_count"
 
     # Otherwise mutate code bytes
     code_arr = bytearray(fn.code)
@@ -258,15 +293,19 @@ def run_fuzzer(
 
             if verdict == "ACCEPTED":
                 accepted_count += 1
-                # Run in safe mode
+                # Run in checked mode
                 try:
-                    vm = VM(stdout=devnull)
+                    vm = VM(stdout=devnull, checked=True)
                     vm.run(mutant, max_steps=step_limit)
                     safe_status = "CLEAN"
                 except VMTrap:
                     safe_status = "VM_TRAP"
                 except TimeoutError:
                     safe_status = "STEP_LIMIT"
+                except VMInvariantError as ie:
+                    safe_status = f"INVARIANT_{type(ie).__name__}"
+                    soundness_violation = True
+                    soundness_violations += 1
                 except Exception as e:
                     # An accepted program crashed with raw Python exception -> SOUNDNESS BUG!
                     safe_status = f"CRASH_{type(e).__name__}"
@@ -277,7 +316,7 @@ def run_fuzzer(
                     try:
                         opt_mod = optimize_module(mutant)
                         verify(opt_mod)
-                        vm_opt = VM(stdout=devnull)
+                        vm_opt = VM(stdout=devnull, checked=True)
                         vm_opt.run(opt_mod, max_steps=step_limit)
                         safe_status = "CLEAN_OPT"
                     except VMTrap:
@@ -286,6 +325,10 @@ def run_fuzzer(
                         safe_status = "STEP_LIMIT_OPT"
                     except VerifyError as ve:
                         safe_status = f"OPT_VERIFY_{ve.rule}"
+                        soundness_violation = True
+                        soundness_violations += 1
+                    except VMInvariantError as ie:
+                        safe_status = f"OPT_INVARIANT_{type(ie).__name__}"
                         soundness_violation = True
                         soundness_violations += 1
                     except Exception as e:
@@ -331,6 +374,105 @@ def run_fuzzer(
     return records, summary
 
 
+def run_file_fuzzer(
+    examples_dir: Path,
+    num_mutations: int,
+    seed: int,
+    step_limit: int = 10000,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Mutate raw bytes of serialize(module) and assert load_bytecode+verify only ever raise BytecodeFormatError or VerifyError."""
+    rng = random.Random(seed)
+    records: List[Dict[str, Any]] = []
+    devnull = io.StringIO()
+
+    total_mutants = 0
+    accepted_count = 0
+    rejected_count = 0
+    rule_counts: Dict[str, int] = {}
+    soundness_violations = 0
+
+    with tempfile.TemporaryDirectory() as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        tmp_bc = tmp_dir / "mutant.bc"
+
+        for example_file in EXAMPLE_FILES:
+            filepath = examples_dir / example_file
+            if not filepath.exists():
+                continue
+
+            base_mod = load_seed_module(filepath)
+            orig_bytes = bytearray(serialize(base_mod.functions, base_mod.entry_func))
+
+            for m_id in range(1, num_mutations + 1):
+                total_mutants += 1
+                mut_bytes = bytearray(orig_bytes)
+                mut_op = rng.choice(MUTATION_OPS)
+                op_name = mut_op(mut_bytes, rng)
+
+                tmp_bc.write_bytes(mut_bytes)
+
+                verdict = "ACCEPTED"
+                rule_name = ""
+                soundness_violation = False
+                safe_status = "N/A"
+
+                try:
+                    mod = load_bytecode(tmp_bc)
+                    verify(mod)
+                except BytecodeFormatError:
+                    verdict = "REJECTED_LOADER"
+                    rule_name = "FORMAT_ERROR"
+                    rule_counts[rule_name] = rule_counts.get(rule_name, 0) + 1
+                except VerifyError as ve:
+                    verdict = "REJECTED_VERIFIER"
+                    rule_name = ve.rule
+                    rule_counts[rule_name] = rule_counts.get(rule_name, 0) + 1
+                except Exception as e:
+                    # Unhandled raw exception from loader or verifier is a soundness bug!
+                    verdict = "UNHANDLED_EXCEPTION"
+                    rule_name = type(e).__name__
+                    soundness_violation = True
+                    soundness_violations += 1
+
+                if verdict == "ACCEPTED":
+                    accepted_count += 1
+                    try:
+                        vm = VM(stdout=devnull, checked=True)
+                        vm.run(mod, max_steps=step_limit)
+                        safe_status = "CLEAN"
+                    except VMTrap:
+                        safe_status = "VM_TRAP"
+                    except TimeoutError:
+                        safe_status = "STEP_LIMIT"
+                    except (VMInvariantError, Exception) as e:
+                        safe_status = f"CRASH_{type(e).__name__}"
+                        soundness_violation = True
+                        soundness_violations += 1
+                elif verdict in ("REJECTED_LOADER", "REJECTED_VERIFIER"):
+                    rejected_count += 1
+
+                records.append({
+                    "program": example_file,
+                    "mutant_id": m_id,
+                    "mutation_type": f"file_{op_name}",
+                    "verdict": verdict,
+                    "rule": rule_name,
+                    "safe_status": safe_status,
+                    "unsafe_status": "N/A",
+                    "soundness_violation": soundness_violation,
+                })
+
+    summary = {
+        "total": total_mutants,
+        "accepted": accepted_count,
+        "rejected": rejected_count,
+        "rule_counts": rule_counts,
+        "unsafe_crashes": 0,
+        "soundness_violations": soundness_violations,
+    }
+    return records, summary
+
+
 def print_summary(summary: Dict[str, Any]):
     print("=" * 60)
     print("                FUZZING CAMPAIGN SUMMARY                ")
@@ -346,7 +488,7 @@ def print_summary(summary: Dict[str, Any]):
         print(f"  {rule:<22s}: {count:>5d} ({count / max(1, summary['rejected']):.1%})")
     print("=" * 60)
     if summary["soundness_violations"] == 0:
-        print("[SUCCESS] Zero soundness violations! The verifier proved 100% sound.")
+        print(f"[SUCCESS] No soundness violations found in {summary['total']} mutants")
     else:
         print(f"[FAIL] Found {summary['soundness_violations']} soundness violations!")
     print("=" * 60)
@@ -385,16 +527,26 @@ def main():
                         help="Maximum VM execution steps per test (default: 10000)")
     parser.add_argument("--opt", action="store_true",
                         help="Enable optimizer on accepted mutants and verify/run them")
+    parser.add_argument("--file-mode", action="store_true",
+                        help="Mutate raw serialized .bc bytes and test loader + verifier robustness")
 
     args = parser.parse_args()
 
-    records, summary = run_fuzzer(
-        examples_dir=Path(args.examples),
-        num_mutations=args.iterations,
-        seed=args.seed,
-        step_limit=args.step_limit,
-        opt=args.opt,
-    )
+    if args.file_mode:
+        records, summary = run_file_fuzzer(
+            examples_dir=Path(args.examples),
+            num_mutations=args.iterations,
+            seed=args.seed,
+            step_limit=args.step_limit,
+        )
+    else:
+        records, summary = run_fuzzer(
+            examples_dir=Path(args.examples),
+            num_mutations=args.iterations,
+            seed=args.seed,
+            step_limit=args.step_limit,
+            opt=args.opt,
+        )
 
     print_summary(summary)
     save_csv(records, Path(args.output))

@@ -1,7 +1,6 @@
 """Worklist abstract interpreter and static verifier."""
 
-from __future__ import annotations
-
+from collections import deque
 from typing import Dict, List, Set
 
 from codegen.generator import BCFunction
@@ -11,6 +10,9 @@ from .cfg import check_jump_targets, compute_successors
 from .decoder import Instruction, decode_function
 from .errors import VerifyError
 from .state import CONFLICT, State, UNSET, merge_states
+
+
+CHECK_STACK_TYPE_ADD: bool = True
 
 
 def verify_module_header(module: BCModule) -> None:
@@ -71,11 +73,11 @@ def verify_function(fn: BCFunction, module: BCModule) -> None:
     entry_state = State(stack=(), locals=tuple(entry_locals))
 
     states: Dict[int, State] = {0: entry_state}
-    worklist: List[int] = [0]
+    worklist: deque[int] = deque([0])
     in_worklist: Set[int] = {0}
 
     while worklist:
-        pc = worklist.pop(0)
+        pc = worklist.popleft()
         in_worklist.remove(pc)
 
         state = states[pc]
@@ -119,9 +121,10 @@ def verify_function(fn: BCFunction, module: BCModule) -> None:
                 raise VerifyError(fn.name, pc, mnemonic, "STACK_UNDERFLOW",
                                   expected="depth >= 2", actual=f"{list(stack)}")
             b, a = stack[-1], stack[-2]
-            if a != "int" or b != "int":
-                raise VerifyError(fn.name, pc, mnemonic, "STACK_TYPE",
-                                  expected="[int, int]", actual=f"{list(stack)}")
+            if CHECK_STACK_TYPE_ADD or op != Op.ADD:
+                if a != "int" or b != "int":
+                    raise VerifyError(fn.name, pc, mnemonic, "STACK_TYPE",
+                                      expected="[int, int]", actual=f"{list(stack)}")
             out_state = State(stack=stack[:-2] + ("int",), locals=locals_tuple)
 
         elif op == Op.NEG:

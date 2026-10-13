@@ -138,8 +138,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                     print(f"verification failed:\n{e}", file=sys.stderr)
                     sys.exit(1)
 
-    vm = VM()
-    ret = vm.run(module)
+    max_call_depth = getattr(args, "max_call_depth", 10000)
+    vm = VM(max_call_depth=max_call_depth)
+    ret = vm.run(module, max_steps=args.max_steps, max_call_depth=max_call_depth)
     return ret if isinstance(ret, int) else 0
 
 
@@ -167,6 +168,8 @@ def main() -> None:
     p_run.add_argument("file", help="Bytecode file (.bc) or source (.ml)")
     p_run.add_argument("--opt", action="store_true", help="Enable bytecode optimizations")
     p_run.add_argument("--unsafe", action="store_true", help="Skip bytecode verification")
+    p_run.add_argument("--max-steps", type=int, default=None, help="Maximum execution steps limit")
+    p_run.add_argument("--max-call-depth", type=int, default=10000, help="Maximum call depth limit (default: 10000)")
 
     args = parser.parse_args()
     if args.command == "compile":
