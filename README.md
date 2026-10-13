@@ -30,7 +30,7 @@ The verifier proves a bytecode file is stack-safe, jump-safe, and type-safe **be
 
 ## Quick Start (Python 3.10+)
 
-Run the full test suite (161 tests):
+Run the full test suite (195 tests):
 
 ```bash
 python -m unittest discover -s tests -t .
@@ -100,9 +100,9 @@ tools/
   fuzz.py       Differential mutation fuzzer testing verifier soundness
   bench.py      Performance benchmark suite (scaling, verifier overhead, optimizer impact)
 demo/           Interactive demonstration scripts (demo.sh, demo.bat)
-tests/          Unit tests across all modules (161 tests)
+tests/          Unit tests across all modules (195 tests)
   malicious/    26 crafted .bc files isolating every verifier rule violation
-results/        Fuzzing results (fuzz_results.csv) and benchmark data (bench.csv, bench.png)
+results/        Fuzzing results (fuzz_seed*.csv) and benchmark data (bench.csv, bench.png)
 docs/           Specifications (GRAMMAR.md, ISA.md, VERIFIER_DESIGN.md, REPORT_RESULTS.md)
 svm.py          Unified command line tool
 ```
